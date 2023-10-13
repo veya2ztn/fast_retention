@@ -5,7 +5,8 @@ The implementation is on par with the official implementation at torchscale repo
 We use [`torch-discounted-cumsum`](https://github.com/toshas/torch-discounted-cumsum) to accelerate computation.
 
 ```
-pip install torch-discounted-cumsum --no-build-isolation
+#pip install torch-discounted-cumsum --no-build-isolation
+pip install git+https://github.com/veya2ztn/torch-discounted-cumsum.git --no-build-isolation
 ```
 
 The "Parallel" formation of retention is simple 
@@ -85,7 +86,7 @@ Now, the max intermediate is $D$ = (B, H, S, D, D).
 
 ----
 ## TODO list
-- broadcast operation
+- ~~broadcast operation~~
 - bfloat16 cuda
 ---------------
 ## 
