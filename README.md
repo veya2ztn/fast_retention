@@ -51,36 +51,42 @@ $$K_{\alpha}^j =  \lambda^{-j} k_{\alpha}^j $$
 Second thing that paper don't say here: another normlaization.
 $$R_{i}^j \rightarrow \frac{R_i^j }{|\sum_t^j R_i^t|} = \frac{R_i^j }{|P_i|}$$
 The $P_i$ can dircly compute
-$$\begin{align}
-P_i=\sum_t R_i^t = \sum_t (Q_i^{\alpha}K_{\alpha}^t \delta_{i>t})
-=\sum_t^i (Q_i^{\alpha}K_{\alpha}^t)
-&=Q_i^{\alpha}\sum_t^i (K_{\alpha}^t)=Q_i^{\alpha}T_{\alpha}^i\\
-&=\frac{q_i^{\alpha}}{L_i}\sum_t^i (\lambda^{i-j}k_{\alpha}^t)=\frac{q_i^{\alpha}}{L_i}\mathbf{T}_{\alpha}^i\\
+$$P_i=\sum_t R_i^t = \sum_t (Q_i^{\alpha}K_{\alpha}^t \delta_{i>t})=\sum_t^i (Q_i^{\alpha}K_{\alpha}^t)$$
+$$=Q_i^{\alpha}\sum_t^i (K_{\alpha}^t)=Q_i^{\alpha}T_{\alpha}^i$$
+$$=\frac{q_i^{\alpha}}{L_i}\sum_t^i (\lambda^{i-j}k_{\alpha}^t)=\frac{q_i^{\alpha}}{L_i}T_{\alpha}^i$$
 
-\end{align}$$
 
-(1) is the formula for reduced $q$ and $k$
+second line is the formula for reduced $q$ and $k$
 
-(2) is the formula for `discounted-cumsum`
+third line is the formula for `discounted-cumsum`
 
 Next
 $$O_i^\gamma=R_i^j v_{j}^\gamma = \frac{R_i^j v_{j}^\gamma}{|P_i|}= \frac{o_i^\gamma}{|P_i|}$$
 
 Still can compute
-$$\begin{align}
-o_i^{\gamma} = R_i^j v_{j}^\gamma = Q_i^{\alpha}\delta_{i>j}K_{\alpha}^j  v_{j}^\gamma
-&= Q_i^{\alpha}(\delta_{i>j} K_{\alpha}^j  v_{j}^\gamma) = Q_i^{\alpha} (D_i)_{\alpha}^\gamma\\
-&=\sum_{\alpha} \frac{q_i^{\alpha}}{L_i} \sum_j^i(\lambda^{i-j} k_{\alpha}^j  v_{j}^\gamma) = \sum_{\alpha}\frac{q_i^{\alpha}}{L_i} (\mathcal{D}_i)_{\alpha}^\gamma\\
-&=\sum_{\alpha}\sum_j \frac{q_i^{\alpha}}{L_i} C_{ij} k_{\alpha}^j v_{j} ^\gamma = \sum_{\alpha}\frac{q_i^{\alpha}}{L_i} (\mathcal{D}_i)_{\alpha}^\gamma\\
-\end{align}$$
+$$o_i^{\gamma} = R_i^j v_{j}^\gamma = Q_i^{\alpha}\delta_{i>j}K_{\alpha}^j  v_{j}^\gamma$$
 
-(1) is the formula for reduced $q$ and $k$
+$$= Q_i^{\alpha}(\delta_{i>j} K_{\alpha}^j  v_{j}^\gamma) = Q_i^{\alpha} (D_i)_{\alpha}^\gamma $$
 
-(2) is the formula for `discounted-cumsum`
+$$=\sum_{\alpha} \frac{q_i^{\alpha}}{L_i} \sum_j^i(\lambda^{i-j} k_{\alpha}^j  v_{j}^\gamma)$$
+$$=\sum_{\alpha}\frac{q_i^{\alpha}}{L_i} (D_i)_{\alpha}^\gamma$$
+
+$$=\sum_{\alpha}\sum_j \frac{q_i^{\alpha}}{L_i} C_{ij} k_{\alpha}^j v_{j} ^\gamma = \sum_{\alpha}\frac{q_i^{\alpha}}{L_i} (D_i)_{\alpha}^\gamma$$
 
 
-(3) [TODO]: dirctly build the operation $\sum_{\alpha}\sum_j \frac{q_i^{\alpha}}{L_i} C_{ij} k_{\alpha}^j v_{j} ^\gamma$
+second line is the formula for reduced $q$ and $k$
+
+third line is the formula for `discounted-cumsum`
+
+(3) ~~[TODO]: dirctly build the operation $\sum_{\alpha}\sum_j \frac{q_i^{\alpha}}{L_i} C_{ij} k_{\alpha}^j v_{j} ^\gamma$~~
+
+
 Now, the max intermediate is $D$ = (B, H, S, D, D).
+
+----
+## TODO list
+- broadcast operation
+- bfloat16 cuda
 ---------------
 ## 
 ```
