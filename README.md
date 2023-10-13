@@ -29,82 +29,58 @@ However, it is $\mathcal{O}(S^2)$ implement as the appear of intermeidate shape 
 Lets drive it step by step.
 
 Firstly, 
-$$
-R_{i}^j = q_i^{\alpha}k_{\alpha}^j
-$$
+$$R_{i}^j = q_i^{\alpha}k_{\alpha}^j$$
 
-with decay mask
 
-$$
-R_{i}^j = C_i^j q_i^{\alpha}k_{\alpha}^j
-$$
+with decay mask 
+$$R_{i}^j = C_i^j q_i^{\alpha}k_{\alpha}^j$$
+
 where
-$$
-C_i^j = \lambda^{i-j} \delta_{i>j}
-$$
+$$C_i^j = \lambda^{i-j} \delta_{i>j}$$
+
 Thus
-$$
-R_{i}^j = \lambda^{i} q_i^{\alpha}k_{\alpha}^j \lambda^{-j} =  \bar{q}_i^{\alpha}\bar{k}_{\alpha}^j \delta_{i>j}
-$$
+$$R_i^j = \lambda^{i} q_i^{\alpha}k_{\alpha}^j \lambda^{-j} = Q_i^{\alpha} K_{\alpha}^j \delta_{i>j}$$
 
 One thing that paper don't say is it will do normlaization.
-$$
-C_i^j = \frac{\lambda^{i-j}}{\sqrt{\sum_i^t (\lambda^{i-t})^2}}=\frac{\lambda^{i-j}}{L_i}=\frac{\lambda^i}{L_i}\lambda^{-j} \delta_{i>j}
-$$
-
+$$C_i^j = \frac{\lambda^{i-j}}{\sqrt{\sum_i^t (\lambda^{i-t})^2}}=\frac{\lambda^{i-j}}{L_i}=\frac{\lambda^i}{L_i}\lambda^{-j} \delta_{i>j}$$
 Notice all the coef is fixed, thus we can precompute at early begining.
 
 Now, we have reduced $q$ and $k$
-$$
-\bar{q}_i^{\alpha} =  \frac{\lambda^i}{L_i}  q_i^{\alpha}
-$$
-
-$$
-\bar{k}_{\alpha}^j =  \lambda^{-j} k_{\alpha}^j 
-$$
-
+$$Q_i^{\alpha} =  \frac{\lambda^i}{L_i}  q_i^{\alpha}$$
+$$K_{\alpha}^j =  \lambda^{-j} k_{\alpha}^j $$
 Second thing that paper don't say here: another normlaization.
-$$
-R_{i}^j \rightarrow \frac{R_i^j }{|\sum_t^j R_i^t|} = \frac{R_i^j }{|P_i|}
-$$
-
+$$R_{i}^j \rightarrow \frac{R_i^j }{|\sum_t^j R_i^t|} = \frac{R_i^j }{|P_i|}$$
 The $P_i$ can dircly compute
-$$
-\begin{align}
-P_i=\sum_t R_i^t = \sum_t (\bar{q}_i^{\alpha}\bar{k}_{\alpha}^t \delta_{i>t})
-=\sum_t^i (\bar{q}_i^{\alpha}\bar{k}_{\alpha}^t)
-&=\bar{q}_i^{\alpha}\sum_t^i (\bar{k}_{\alpha}^t)=\bar{q}_i^{\alpha}T_{\alpha}^i\\
+$$\begin{align}
+P_i=\sum_t R_i^t = \sum_t (Q_i^{\alpha}K_{\alpha}^t \delta_{i>t})
+=\sum_t^i (Q_i^{\alpha}K_{\alpha}^t)
+&=Q_i^{\alpha}\sum_t^i (K_{\alpha}^t)=Q_i^{\alpha}T_{\alpha}^i\\
 &=\frac{q_i^{\alpha}}{L_i}\sum_t^i (\lambda^{i-j}k_{\alpha}^t)=\frac{q_i^{\alpha}}{L_i}\mathbf{T}_{\alpha}^i\\
 
-\end{align}
-$$
+\end{align}$$
+
 (1) is the formula for reduced $q$ and $k$
 
 (2) is the formula for `discounted-cumsum`
 
 Next
-$$
-O_i^\gamma=R_i^j v_{j}^\gamma = \frac{R_i^j v_{j}^\gamma}{|P_i|}= \frac{o_i^\gamma}{|P_i|}
-$$
+$$O_i^\gamma=R_i^j v_{j}^\gamma = \frac{R_i^j v_{j}^\gamma}{|P_i|}= \frac{o_i^\gamma}{|P_i|}$$
 
 Still can compute
-
-$$
-\begin{align}
-o_i^{\gamma} = R_i^j v_{j}^\gamma = \bar{q}_i^{\alpha}\delta_{i>j}\bar{k}_{\alpha}^j  v_{j}^\gamma
-&= \bar{q}_i^{\alpha}(\delta_{i>j} \bar{k}_{\alpha}^j  v_{j}^\gamma) = \bar{q}_i^{\alpha} (D_i)_{\alpha}^\gamma\\
+$$\begin{align}
+o_i^{\gamma} = R_i^j v_{j}^\gamma = Q_i^{\alpha}\delta_{i>j}K_{\alpha}^j  v_{j}^\gamma
+&= Q_i^{\alpha}(\delta_{i>j} K_{\alpha}^j  v_{j}^\gamma) = Q_i^{\alpha} (D_i)_{\alpha}^\gamma\\
 &=\sum_{\alpha} \frac{q_i^{\alpha}}{L_i} \sum_j^i(\lambda^{i-j} k_{\alpha}^j  v_{j}^\gamma) = \sum_{\alpha}\frac{q_i^{\alpha}}{L_i} (\mathcal{D}_i)_{\alpha}^\gamma\\
 &=\sum_{\alpha}\sum_j \frac{q_i^{\alpha}}{L_i} C_{ij} k_{\alpha}^j v_{j} ^\gamma = \sum_{\alpha}\frac{q_i^{\alpha}}{L_i} (\mathcal{D}_i)_{\alpha}^\gamma\\
-\end{align}
-$$
+\end{align}$$
 
 (1) is the formula for reduced $q$ and $k$
 
 (2) is the formula for `discounted-cumsum`
 
+
 (3) [TODO]: dirctly build the operation $\sum_{\alpha}\sum_j \frac{q_i^{\alpha}}{L_i} C_{ij} k_{\alpha}^j v_{j} ^\gamma$
 Now, the max intermediate is $D$ = (B, H, S, D, D).
-
 ---------------
 ## 
 ```
