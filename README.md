@@ -1,5 +1,5 @@
-
-2X speed up implementation of retention operation of Retention Networks. (https://arxiv.org/pdf/2307.08621.pdf)
+# Faster_Retention
+nX speed up implementation of retention operation of Retention Networks. (https://arxiv.org/pdf/2307.08621.pdf)
 The implementation is on par with the official implementation at torchscale repo.
 
 We use [`torch-discounted-cumsum`](https://github.com/toshas/torch-discounted-cumsum) to accelerate computation.
@@ -9,6 +9,7 @@ We use [`torch-discounted-cumsum`](https://github.com/toshas/torch-discounted-cu
 pip install git+https://github.com/veya2ztn/torch-discounted-cumsum.git --no-build-isolation
 ```
 
+## Motivation
 The "Parallel" formation of retention is simple 
 ```
 def forward(self, q, k, v, decay_mask):
