@@ -88,7 +88,7 @@ Now, the max intermediate is $D$ = (B, H, S, D, D).
 ----
 ## TODO list
 - ~~broadcast operation~~
-- bfloat16 cuda
+- ~~bfloat16 cuda~~ (Lazy implement) (wondering pow percision for bfloat16)
 ---------------
 ## 
 ```
