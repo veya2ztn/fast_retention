@@ -1,7 +1,7 @@
 from einops import rearrange
 import torch
 import torch.nn as nn
-from torch_discounted_cumsum import  discounted_cumsum_left
+from torch_discounted_cumsum import  discounted_cumsum_left, discounted_cumsum3_left
 
 class Discounted_Cumsum(nn.Module):
     """
@@ -18,8 +18,11 @@ class Discounted_Cumsum(nn.Module):
         super().__init__()
         self.dim_head  = dim_head
         self.dim_leng  = dim_leng
-        
+    
     def forward(self, tensor, gamma):
+        return self.forward2(tensor, gamma)
+
+    def forward1(self, tensor, gamma):
         _shape = tensor.shape
         assert _shape[self.dim_head] == gamma.shape[-1]
         ## then permute the target dim into 
@@ -43,6 +46,37 @@ class Discounted_Cumsum(nn.Module):
             tensor = tensor.view(*_shape)
         return tensor
 
+    def forward2(self, tensor, gamma):
+        _shape = tensor.shape
+        assert _shape[self.dim_head] == gamma.shape[-1]
+        ## then permute the target dim into
+        # (B, D, H, S) or (B, D1, D2, H, S)
+        if self.dim_head == -2 and self.dim_leng == -1:
+            tensor = tensor.view(-1, _shape[-1])  # (B*D*H, S)
+        elif self.dim_head == 1 and self.dim_leng == 2:
+            if len(_shape) == 4:
+                tensor = rearrange(tensor, 'B H S D -> (B D) H S')
+            elif len(_shape) == 5:
+                tensor = rearrange(tensor, 'B H S D1 D2 -> (B D1 D2) H S')
+            else:
+                raise NotImplementedError
+        else:
+            raise NotImplementedError
+        # (H,) -> (B*D*H,) ## same as gamma.unsqueeze(0).unsqueeze(0).repeat(B,D,1).view(-1)
+        gamma = gamma#.repeat(len(tensor)//len(gamma))
+        tensor = discounted_cumsum3_left(tensor, gamma)
+        if len(_shape) == 4:
+            B, H, S, D = _shape
+            tensor = rearrange(tensor, '(B D) H S -> B H S D', B=B)
+        elif len(_shape) == 5:
+            B, H, S, D1, D2 = _shape
+            tensor = rearrange(
+                tensor, '(B D1 D2) H S -> B H S D1 D2',  B=B, D1=D1)
+        else:
+            raise
+            tensor = tensor.view(*_shape)
+        return tensor
+
 class ParallelRetention_fast(nn.Module):
     def __init__(self):
         super().__init__()
@@ -50,7 +84,7 @@ class ParallelRetention_fast(nn.Module):
         self.gamma_cusum_2 = Discounted_Cumsum(1,2)
     
     def forward(self, q, k, v, omask):
-        gamma = omask[0,:,1,0]
+        gamma = omask[0,:,1,0].float()
         L     = omask.sum(dim=-1).sqrt()[...,None]
         qL    = q/L
         Tbf   = self.gamma_cusum_1(k,gamma)
@@ -114,31 +148,38 @@ if __name__ == "__main__":
     layer2= ParallelRetention_reduce()
     layer3= ParallelRetention_origin()
     records = []
+    configs = []
     H = 16
-    for B in [2]:
-        for S in [30, 300, 3000]:
-            for D in [4, 8 , 16, 32]:
-                q     =  torch.randn(2,H,S,D).cuda()
-                k     =  torch.randn(2,H,S,D).cuda()
-                v     =  torch.randn(2,H,S,D).cuda()
-                omask = get_omask(S,H).cuda()
-                O1 = layer1(q,k,v,omask)
-                O2 = layer2(q,k,v,omask)
-                O3 = layer3(q,k,v,omask)
-                e1 = torch.dist(O1,O3).item()
-                e2 = torch.dist(O2,O3).item()
-                record = [B,S,D,e1,e2]
-                print(record)
-                for model in [layer1, layer2, layer3]:
-                    costs = []
-                    for _ in tqdm(range(100)):
-                        now = time.time()
-                        O = model(q,k,v,omask)
-                        #O.mean().backward()
-                        cost = time.time()-now
-                        costs.append(cost)
-                    record.append(np.mean(cost))
-                records.append(record)
-    dataframe = pd.DataFrame(records, columns=['B','S','D','e1','e2','fast','reduce','origin'])
+    for B in [1]:
+        for S in [10, 30, 100, 1000]:
+            for D1 in [8, 16, 32]:
+                for D2 in [64]:
+                    configs.append([B,S,D1,D2])
+    for B,S,D1,D2 in tqdm(configs):
+        
+        q     =  torch.randn(2,H,S,D1).cuda()#  float16 and bfloat16 always get wrong result ###.half()
+        k     =  torch.randn(2,H,S,D1).cuda()#  float16 and bfloat16 always get wrong result ###.half()
+        v     =  torch.randn(2,H,S,D2).cuda()#  float16 and bfloat16 always get wrong result ###.half()
+        omask =         get_omask(S,H).cuda()#  float16 and bfloat16 always get wrong result ###.half()
+        O1 = layer1(q,k,v,omask)
+        O2 = layer2(q,k,v,omask)
+        O3 = layer3(q,k,v,omask)
+        e1 = torch.dist(O1,O3).item()
+        e2 = torch.dist(O2,O3).item()
+        record = [B,S,D1,D2,e1,e2]
+        #print(record)
+        for model in [layer1, layer2, layer3]:
+            costs = []
+            for _ in range(100):
+                now = time.time()
+                O = model(q,k,v,omask)
+                #O.mean().backward()
+                cost = time.time()-now
+                costs.append(cost)
+            record.append(np.mean(cost))
+        records.append(record)
+    dataframe = pd.DataFrame(records, columns=['B','S','D1','D2','e1','e2','fast','reduce','origin'])
+    dataframe['speed_up_fast'] = np.round(dataframe['origin']/dataframe['fast'],3)
+    dataframe['speed_up_reduce'] = np.round(dataframe['origin']/dataframe['reduce'],3)
     print(dataframe)
     dataframe.to_csv('benchmark.csv',index=False)
