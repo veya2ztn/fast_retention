@@ -52,7 +52,7 @@ $$Q_i^{\alpha} =  \frac{\lambda^i}{L_i}  q_i^{\alpha}$$
 $$K_{\alpha}^j =  \lambda^{-j} k_{\alpha}^j $$
 Second thing that paper don't say here: another normlaization.
 $$R_{i}^j \rightarrow \frac{R_i^j }{|\sum_t^j R_i^t|} = \frac{R_i^j }{|P_i|}$$
-The $P_i$ can dircly compute
+The $P_i$ can dirctly compute
 $$P_i=\sum_t R_i^t = \sum_t (Q_i^{\alpha}K_{\alpha}^t \delta_{i>t})=\sum_t^i (Q_i^{\alpha}K_{\alpha}^t)$$
 $$=Q_i^{\alpha}\sum_t^i (K_{\alpha}^t)=Q_i^{\alpha}T_{\alpha}^i$$
 $$=\frac{q_i^{\alpha}}{L_i}\sum_t^i (\lambda^{i-j}k_{\alpha}^t)=\frac{q_i^{\alpha}}{L_i}T_{\alpha}^i$$
