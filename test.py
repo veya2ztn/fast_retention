@@ -150,16 +150,16 @@ if __name__ == "__main__":
     records = []
     configs = []
     H = 16
-    for B in [1]:
-        for S in [10, 30, 100, 1000]:
+    for B in [1, 10]:
+        for S in [10, 30, 100, 1000, 2000]:
             for D1 in [8, 16, 32]:
-                for D2 in [64]:
-                    configs.append([B,S,D1,D2])
+                #for D2 in [64]:
+                    configs.append([B,S,D1,D1])
     for B,S,D1,D2 in tqdm(configs):
         
-        q     =  torch.randn(2,H,S,D1).cuda()#  float16 and bfloat16 always get wrong result ###.half()
-        k     =  torch.randn(2,H,S,D1).cuda()#  float16 and bfloat16 always get wrong result ###.half()
-        v     =  torch.randn(2,H,S,D2).cuda()#  float16 and bfloat16 always get wrong result ###.half()
+        q     =  torch.randn(B,H,S,D1).cuda()#  float16 and bfloat16 always get wrong result ###.half()
+        k     =  torch.randn(B,H,S,D1).cuda()#  float16 and bfloat16 always get wrong result ###.half()
+        v     =  torch.randn(B,H,S,D2).cuda()#  float16 and bfloat16 always get wrong result ###.half()
         omask =         get_omask(S,H).cuda()#  float16 and bfloat16 always get wrong result ###.half()
         O1 = layer1(q,k,v,omask)
         O2 = layer2(q,k,v,omask)
@@ -168,15 +168,20 @@ if __name__ == "__main__":
         e2 = torch.dist(O2,O3).item()
         record = [B,S,D1,D2,e1,e2]
         #print(record)
+        
         for model in [layer1, layer2, layer3]:
-            costs = []
-            for _ in range(100):
-                now = time.time()
-                O = model(q,k,v,omask)
-                #O.mean().backward()
-                cost = time.time()-now
-                costs.append(cost)
-            record.append(np.mean(cost))
+            try:
+                costs = []
+                for _ in range(100):
+                    now = time.time()
+                    O = model(q,k,v,omask)
+                    #O.mean().backward()
+                    cost = time.time()-now
+                    costs.append(cost)
+                cost = np.mean(cost)
+            except:
+                cost = np.nan
+            record.append(cost)
         records.append(record)
     dataframe = pd.DataFrame(records, columns=['B','S','D1','D2','e1','e2','fast','reduce','origin'])
     dataframe['speed_up_fast'] = np.round(dataframe['origin']/dataframe['fast'],3)
