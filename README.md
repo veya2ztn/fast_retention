@@ -4,7 +4,7 @@ The implementation is on par with the official implementation at [`torchscale`](
 
 **Notice**: This implement only suitable for **large** sequence length and small head dimension. Assume the dimension of query $q$ is $(B,H,S,D)$, you can enjoy considerable speed up for $S>>D^2$. Run `python test.py` for benchmark. 
 ```
-python test.py #(Platform: 3090)
+python test.py #(Platform: 3090) (e1 = fast-origin) (e2 = reduce - origin)
 
     B     S   D        e1        e2      fast    reduce    origin  speed_up
 0   1    30   8  0.000032  0.000033  0.000435  0.000212  0.000118     0.272
