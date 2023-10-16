@@ -26,7 +26,7 @@ def forward(self, q, k, v, decay_mask):
     return output
 ```
 
-However, it is $\mathcal{O}(S^2)$ implement as the appear of intermeidate shape $(S,S)$. It is wellknow retention is a 'Linear' like Transfomer, thus it is possible we contract the $S$ dimension first and reduce the complexity into $\mathcal{O}(D^2)$.
+However, it is $\mathcal{O}(S^2)$ implement as the appear of intermeidate shape $(S,S)$. It is wellknow retention is a 'Linear-like' Transfomer that it is possible we contract the $S$ dimension first and reduce the complexity into $\mathcal{O}(D^2)$.
 
 Lets drive it step by step.
 
