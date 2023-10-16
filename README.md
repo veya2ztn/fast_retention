@@ -1,4 +1,4 @@
-# Faster_Retention
+# Faster_Retention for large sequence
 nX speed up implementation of retention operation of Retention Networks. (https://arxiv.org/pdf/2307.08621.pdf)
 The implementation is on par with the official implementation at [`torchscale`](https://github.com/microsoft/torchscale) repo and [huggingface transformer compatible implementation of Retention Networks](https://github.com/syncdoth/RetNet)
 
