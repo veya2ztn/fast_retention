@@ -3,6 +3,7 @@ import torch
 import torch.nn as nn
 from torch_discounted_cumsum import  discounted_cumsum_left, discounted_cumsum3_left
 import numpy as py
+from torch_discounted_cumsum.discounted_cumsum import qkvg_retention,weighted_cumsum_batch
 
 class Discounted_Cumsum(nn.Module):
     """
@@ -98,6 +99,39 @@ class ParallelRetention_fast(nn.Module):
         O     = torch.einsum('BHia,BHiac->BHic',qL,D)/P
         return O
 
+class ParallelRetention_fast2(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.gamma_cusum_1 = Discounted_Cumsum(1,2)
+        self.gamma_cusum_2 = Discounted_Cumsum(1,2)
+    
+    def forward(self, q, k, v, omask=None, gamma=None, L=None):
+        if gamma is None:gamma = omask[0,:,1,0].float()
+        if L is None:L     = omask.sum(dim=-1,keepdim=True)
+        qL    = q/L
+        Tbf   = self.gamma_cusum_1(k,gamma)
+        P     = torch.einsum('BHia, BHia->BHi',qL, Tbf)
+        P     = P[...,None].detach().abs().clamp(min=1)
+        #qL    = qL
+        O     = qkvg_retention(qL,k,v,omask[0])/P
+        return O
+
+class ParallelRetention_fast3(nn.Module):
+    def __init__(self):
+        super().__init__()
+        
+    
+    def forward(self, q, k, v, omask=None, gamma=None, L=None):
+        if gamma is None:gamma = omask[0,:,1,0].float()
+        if L is None:L     = omask.sum(dim=-1,keepdim=True)
+        B,H,S,D = k.shape
+        qL    = q/L
+        Tbf   = weighted_cumsum_batch(k.permute(0,3,1,2).flatten(0,1), omask[0]).reshape(B,D,H,S).permute(0,2,3,1)
+        P     = torch.einsum('BHia, BHia->BHi',qL, Tbf)
+        P     = P[...,None].detach().abs().clamp(min=1)
+        O     = qkvg_retention(qL,k,v,omask[0])/P
+        return O
+    
 class ParallelRetention_reduce(nn.Module):
     
     def forward(self, q, k, v, omask,*args,**kargs):
@@ -126,7 +160,7 @@ class ParallelRetention_origin(nn.Module):
         retention = retention / retention.detach().sum(dim=-1, keepdim=True).abs().clamp(min=1) # --> (B,H,S,S)
         output = retention @ v  # [b, h, t, v_dim / h] ## # --> (B,H,S,D)
         return output
-    
+
 
 def get_omask(slen, num_heads):
     decay = torch.log(1 - 2**(-5 - torch.arange(num_heads, dtype=torch.float)))
@@ -149,39 +183,53 @@ if __name__ == "__main__":
     import numpy as np
     import pandas as pd
     layer1= ParallelRetention_fast()
-    layer2= ParallelRetention_reduce()
-    layer3= ParallelRetention_origin()
+    layer2= ParallelRetention_fast2()
+    layer3= ParallelRetention_fast3()
+    layer4= ParallelRetention_reduce()
+    layer5= ParallelRetention_origin()
     records = []
     configs = []
     
     for B in [1]:
-        for S in [32, 64, 128, 256, 512, 1024]:
-            for D1 in [8, 16, 32, 64]:
-                #for D2 in [64]:
-                for H in [16]:
-                    configs.append([B,H,S,D1,D1])
+        for S in [100, 500, 1000]:
+            for D1 in [8, 16, 32]:
+                for D2 in [64]:
+                    for H in [16]:
+                        configs.append([B,H,S,D1,D2])
     records = []
-    for B,H,S,D1,D2 in tqdm(configs):
+    for B,H,S,D1,D2 in tqdm(configs, desc="Outer Loop", position=0):
         
-        q     =  (torch.randn(B,H,S,D1).cuda()/np.sqrt(S*D1))#  float16 and bfloat16 may get wrong result if the q@k@v too large. Normlize it thus q@k@v be a normal distribution
-        k     =  (torch.randn(B,H,S,D1).cuda()/np.sqrt(S*D1))#  float16 and bfloat16 may get wrong result if the q@k@v too large. Normlize it thus q@k@v be a normal distribution
-        v     =  (torch.randn(B,H,S,D2).cuda()/np.sqrt(S*D2))#  float16 and bfloat16 may get wrong result if the q@k@v too large. Normlize it thus q@k@v be a normal distribution
+        q     =  (torch.randn(B,H,S,D1)/np.sqrt(S*D1)).cuda()#  float16 and bfloat16 may get wrong result if the q@k@v too large. Normlize it thus q@k@v be a normal distribution
+        k     =  (torch.randn(B,H,S,D1)/np.sqrt(S*D1)).cuda()#  float16 and bfloat16 may get wrong result if the q@k@v too large. Normlize it thus q@k@v be a normal distribution
+        v     =  (torch.randn(B,H,S,D2)/np.sqrt(S*D2)).cuda()#  float16 and bfloat16 may get wrong result if the q@k@v too large. Normlize it thus q@k@v be a normal distribution
         omask =                         get_omask(S,H).cuda()#  float16 and bfloat16 always get wrong result ###.half()
         gamma = omask[0,:,1,0].float()
         L     = omask.sum(dim=-1).sqrt()[...,None]
         O1 = layer1(q,k,v,omask, gamma, L)
-        O2 = layer2(q,k,v,omask, gamma, L)
-        O3 = layer3(q,k,v,omask, gamma, L)
-        e1 = torch.dist(O1,O3).item()
-        e2 = torch.dist(O2,O3).item()
-        record = [B,H,S,D1,D2,e1,e2]
+        # O2 = layer2(q,k,v,omask, gamma, L)
+        # O3 = layer3(q,k,v,omask, gamma, L)
+        O4 = layer4(q,k,v,omask, gamma, L)
+        O5 = layer5(q,k,v,omask, gamma, L)
+        
+        e1 = torch.dist(O1,O5).item()
+        #e2 = torch.dist(O2,O5).item()
+        #e3 = torch.dist(O3,O5).item()
+        e4 = torch.dist(O4,O5).item()
+        
+        record = [B,H,S,D1,D2,e1,#e2,e3,
+                  e4
+                  ]
         #print(record)
         
         for model in [layer1, 
-                      layer2, 
-                      layer3]:
+                    #   layer2, 
+                    #   layer3,
+                      layer4,
+                      layer5
+                      ]:
+            
             costs = []
-            for _ in range(100):
+            for _ in tqdm(range(100), desc="Inner Loop", position=1, leave=False):
                 now = time.time()
                 O = model(q,k,v,omask, gamma, L)
                 #O.mean().backward()
@@ -191,11 +239,13 @@ if __name__ == "__main__":
             
             record.append(cost)
         records.append(record)
-    dataframe = pd.DataFrame(records, columns=['B','H','S','D1','D2','e1','e2','fast','reduce','origin'])
+    dataframe = pd.DataFrame(records, columns=['B','H','S','D1','D2','e1','e2',#'e3','e4',
+                                               'fast',#'fast2','fast3',
+                                               'reduce','origin'])
     dataframe['speed_up_fast'] = np.round(dataframe['origin']/dataframe['fast'],3)
     dataframe['speed_up_reduce'] = np.round(dataframe['origin']/dataframe['reduce'],3)
     print(dataframe)
-    dataframe.to_csv('benchmark.csv',index=False)
+    dataframe.to_csv('benchmark_more.csv',index=False)
 
     ####### percision case
     # for B in [1]:
