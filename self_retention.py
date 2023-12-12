@@ -1,7 +1,17 @@
 import torch
 import torch.nn as nn
-
-
+from einops import rearrange
+import numpy as np 
+# try:
+#     from torch_discounted_cumsum import  discounted_cumsum3_left
+# except:
+#     print("WARNING: torch_discounted_cumsum not installed, using pure python implementation.")
+import os
+try:
+    import opt_einsum as oe    
+    from opt_einsum import contract
+except:
+    pass
 class RMSNorm(nn.Module):
 
     def __init__(self, dim: int, eps: float = 1e-6, elementwise_affine=True):
@@ -431,14 +441,21 @@ class RetNetRelPosV2(nn.Module):
         angle = angle.unsqueeze(-1).repeat(1, 2).flatten()
         # decay (gamma)
         if config.use_lm_decay:
+            ###### lets control the perception window
+            disapear_limit = torch.Tensor([0.0001])
+            min_perception_distance = 100
+            max_perception_distance = config.use_lm_decay
+            decay = torch.log(disapear_limit)/torch.linspace(min_perception_distance, max_perception_distance, num_heads)
+            
             # NOTE: alternative way described in the paper
-            s = torch.log(torch.tensor(1 / 32))
-            e = torch.log(torch.tensor(1 / 512))
-            decay = torch.log(
-                1 - torch.exp(torch.linspace(s, e, num_heads)))  # [h,]
+            # s = torch.log(torch.tensor(1 / 32))
+            # e = torch.log(torch.tensor(1 / 512))
+            # decay = torch.log(1 - torch.exp(torch.linspace(s, e, num_heads)))  # [h,]
         else:
-            decay = torch.log(
-                1 - 2**(-5 - torch.arange(num_heads, dtype=torch.float)))
+            decay = torch.log(1 - 2**(-5 - torch.arange(num_heads, dtype=torch.float)))
+        local_rank = int(os.environ["LOCAL_RANK"]) if "LOCAL_RANK" in os.environ else 0
+        if local_rank == 0:
+            print(f"use decay {decay.exp()}")
         self.register_buffer("angle", angle)
         self.register_buffer("decay", decay)
         self.recurrent_chunk_size = config.recurrent_chunk_size
@@ -464,32 +481,34 @@ class RetNetRelPosV2(nn.Module):
         else:
             raise NotImplementedError
 
-        if slen in self.cache_sincos and recurrent_chunk_size in self.cache_sincos[slen]:
+        if self.training and slen in self.cache_sincos and recurrent_chunk_size in self.cache_sincos[slen]:
             sin, cos = self.cache_sincos[slen][recurrent_chunk_size]
         else:
             index = torch.arange(slen-recurrent_chunk_size, slen).to(self.decay)
             sin = torch.sin(index[:, None] * self.angle[None, :])
             cos = torch.cos(index[:, None] * self.angle[None, :])
-            if slen not in self.cache_sincos:
-                self.cache_sincos[slen] = {}
-            self.cache_sincos[slen][recurrent_chunk_size] = (sin, cos)
+            if self.training:
+                if slen not in self.cache_sincos:self.cache_sincos[slen] = {}
+                self.cache_sincos[slen][recurrent_chunk_size] = (sin, cos)
 
-        if slen in self.cache_mask and recurrent_chunk_size in self.cache_mask[slen]:
-            chunk_gamma, mask, L = self.cache_mask[slen][recurrent_chunk_size]
+        if self.training and slen in self.cache_mask and recurrent_chunk_size in self.cache_mask[slen]:
+            chunk_gamma, mask, L, Coef_Q, Coef_K = self.cache_mask[slen][recurrent_chunk_size]
         else:
             block_index = torch.arange(recurrent_chunk_size).to(self.decay)
             mask = self.create_tril_up_decay_mask(self.decay, block_index)
 
-            last_mask = self.create_tril_up_decay_mask(
-                self.decay, torch.arange(slen).to(self.decay), recurrent_chunk_size)
+            last_mask = self.create_tril_up_decay_mask(self.decay, torch.arange(slen).to(self.decay), recurrent_chunk_size)
             L = last_mask.sum(dim=-1).sqrt()
             chunk_gamma = torch.einsum('H,C->HC', self.decay, block_index+1).exp()
-            if slen not in self.cache_mask:
-                self.cache_mask[slen] = {}
-            self.cache_mask[slen][recurrent_chunk_size] = (
-                chunk_gamma, mask, L)
 
-        retention_rel_pos = ((sin, cos), (chunk_gamma, mask, L))
+            Coef_Q = torch.einsum('H,C->HC', self.decay, block_index - recurrent_chunk_size//2).exp()
+            Coef_K = torch.einsum('H,C->HC', self.decay,-block_index + recurrent_chunk_size//2).exp()
+        
+            if self.training:
+                if slen not in self.cache_mask:self.cache_mask[slen] = {}
+                self.cache_mask[slen][recurrent_chunk_size] = (chunk_gamma, mask, L, Coef_Q, Coef_K)
+
+        retention_rel_pos = ((sin, cos), (chunk_gamma, mask, L, Coef_Q, Coef_K))
 
         return retention_rel_pos
 
@@ -506,9 +525,24 @@ class RetNetRelPosV2(nn.Module):
         mask = torch.nan_to_num(mask)
         return mask
 
-
+def get_output_increment(k, v, mode,kv=None):
+        if mode == True: mode = 'kv'
+        if mode == 'kv_sum_norm':
+            return k.norm(dim=(-1)) + v.norm(dim=(-1)) #(B, H, C2)
+        elif mode == 'kv':
+            # will produce the norm sum((k_i * v_j)^2 for all i,j) is same as \sum_i(k_i)^2 \sum_j(v_j)^2
+            if kv is not None:return kv
+            return k.unsqueeze(-1)*v.unsqueeze(-2) #(B, H, C2, D1, D2)
+        elif mode == 'kv_norm':
+            return k.norm(dim=(-1))*v.norm(dim=(-1)) #(B, H, C2, D1, D2)
+        elif mode == 'v_norm':
+            return v.norm(dim=(-1)) #(B, H, C2, D1, D2)
+        elif mode == 'k_norm':
+            return k.norm(dim=(-1)) #(B, H, C2, D1, D2)
+        else:
+            raise NotImplementedError(f"mode {mode} is not implemented")
 class SelfRetentionV2(nn.Module):
-    def __init__(self, config, normlize_for_stable=True):
+    def __init__(self, config):
         super().__init__()
         self.config = config
         self.embed_dim = config.decoder_embed_dim
@@ -519,37 +553,82 @@ class SelfRetentionV2(nn.Module):
         self.scaling = self.key_dim**-0.5
         self.use_flash_retention = config.use_flash_retention
         self.group_norm = RMSNorm(self.head_dim, eps=config.layernorm_eps, elementwise_affine=False)
-        self.normlize_for_stable = normlize_for_stable
+        self.normlize_for_stable = config.normlize_for_stable
+        self.denominator_scaler  = None
+        self.best_contract_path = {}
+        self.retention_mode = config.retention_mode
 
+        
     def forward(self, q, k, v,
                 decay_system,
                 past_key_value=None,
                 retention_mask=None,
                 forward_impl='parallel',
-                mode = 'qk_first',
-                normlize_for_stable=None):
+                mode = None,
+                normlize_for_stable=None,
+                output_increment=False):
         normlize_for_stable = self.normlize_for_stable if normlize_for_stable is None else normlize_for_stable
-        if mode == 'kv_first':
-            o, cache =  self.kv_first_forward(q, k, v, decay_system, past_key_value=past_key_value, retention_mask=retention_mask, forward_impl=forward_impl, normlize_for_stable=normlize_for_stable)
-        elif mode == 'qk_first':
-            o, cache = self.qk_first_forward(q, k, v, decay_system, past_key_value=past_key_value, retention_mask=retention_mask, forward_impl=forward_impl, normlize_for_stable=normlize_for_stable)
-        elif mode == 'readable_qk_first':
-            o, cache = self.readable_qk_first_forward(q, k, v, decay_system, past_key_value=past_key_value,
-                                                      retention_mask=retention_mask, forward_impl=forward_impl, normlize_for_stable=normlize_for_stable)
-        elif mode == 'readable_kv_first':
-            o, cache = self.readbale_kv_first_forward(q, k, v, decay_system, past_key_value=past_key_value,
-                                                      retention_mask=retention_mask, forward_impl=forward_impl, normlize_for_stable=normlize_for_stable)
+        mode = self.retention_mode if mode is None else mode
         
+        if normlize_for_stable == -1:
+            normlize_for_stable = self.training ## only enable when training.
+        elif normlize_for_stable == -2:
+            B,H,S1,D1 = q.shape
+            B,H,S2,D1 = k.shape
+            B,H,S2,D2 = v.shape
+            if self.denominator_scaler is None:
+                self.denominator_scaler = np.sqrt(D1*S2)
+            normlize_for_stable = self.denominator_scaler if self.training else False 
+            ## False due to we also want to work for recurrent mode
+        retention = None 
+        increment = None
+        
+        if mode in ['kv_reduce_fast','chain_reduce']:
+            if self.training: 
+                assert forward_impl == 'parallel', "only support parallel mode when training for kv_reduce_fast mode"
+            else:
+                if forward_impl != 'parallel':
+                    mode = 'qk_first' ### automative change to qk_first when not training
+
+        kargs = {
+            'past_key_value':past_key_value,
+            'retention_mask':retention_mask,
+            'normlize_for_stable':normlize_for_stable,
+            'only_output': forward_impl == 'parallel' and self.training
+        }
+
+        if mode == 'kv_first':
+            o, cache,increment =  self.kv_first_forward(q, k, v, decay_system, output_increment=output_increment, **kargs)
+        elif mode == 'readable_kv_first':
+            o, cache,increment = self.readbale_kv_first_forward(q, k, v, decay_system, output_increment=output_increment, **kargs)
+        elif mode == 'qk_first':
+            o, cache = self.qk_first_forward(q, k, v, decay_system, **kargs)
+            if output_increment:increment = get_output_increment(k,v,output_increment)
+        elif mode == 'readable_qk_first':
+            o, cache = self.readable_qk_first_forward(q, k, v, decay_system, **kargs)
+            if output_increment:increment = get_output_increment(k,v,output_increment)
+        
+        elif mode == 'kv_reduce':
+            o, cache = self.kv_reduce_forward(q, k, v, decay_system,**kargs)
+            if output_increment:increment = get_output_increment(k,v,output_increment)
+        elif mode == 'kv_reduce_fast':
+            o, cache = self.kv_reduce_fast_forward(q, k, v, decay_system,**kargs)
+            if output_increment:increment = get_output_increment(k,v,output_increment)
+        elif mode == 'chain_reduce':
+            o, cache = self.chain_forward(q, k, v, decay_system, **kargs)
+            if output_increment:increment = get_output_increment(k,v,output_increment)
         else:
             raise NotImplementedError("mode must be 'kv_first' or 'qk_first'")
-        return self.group_norm(o), None, cache
+        
+        
+            
+        return self.group_norm(o), retention, cache, increment
     
     @staticmethod
     def readable_qk_first_forward(q, k, v,
                          decay_system,
                          past_key_value=None,
-                         retention_mask=None,
-                         forward_impl='parallel',
+                         retention_mask=None,only_output=False,
                          normlize_for_stable=True):
         """
         q,    # (B,H,C1,D1)
@@ -566,35 +645,47 @@ class SelfRetentionV2(nn.Module):
         """
         # (b, h, v_dim, qk_dim)
         
-        chunk_gamma, unnormlized_decay_mask, mask_normlizer = decay_system
+        chunk_gamma, unnormlized_decay_mask, mask_normlizer, Coef_Q, Coef_K= decay_system
         H,C1,C2 = unnormlized_decay_mask.shape
         q = q/mask_normlizer.view(1,H,C1,1)
 
         normlized_qk   = torch.einsum('BHia,BHja->BHij',q, k)*unnormlized_decay_mask.view(1,H,C1,C2)
         numerator      = torch.einsum('BHij,BHjc->BHic',normlized_qk, v) 
-        denominator    = normlized_qk.detach().sum(-1) if normlize_for_stable else None #(B,H,C1)
+        if normlize_for_stable:
+            if isinstance(normlize_for_stable, float) and normlize_for_stable > 0 :
+                denominator = normlize_for_stable
+            else:
+                denominator = normlized_qk.detach().sum(-1)  #(B,H,C1)
+        else:
+            denominator = None
         current_scale  =  mask_normlizer# let the norm be directly assigned by decay_system is designed.
         
-        last_unnormlized_kv = torch.einsum('BHja,Hj,BHjc->BHac', k ,unnormlized_decay_mask[:,-1], v) # (B, H ,D1, D2)
-        last_unnormlized_gk = torch.einsum('BHja,Hj->BHa', k ,unnormlized_decay_mask[:,-1]).detach() if normlize_for_stable else None #(B,H,C1)
+        if not only_output:last_unnormlized_kv = torch.einsum('BHja,Hj,BHjc->BHac', k ,unnormlized_decay_mask[:,-1], v) # (B, H ,D1, D2)
+        if not only_output:last_unnormlized_gk = torch.einsum('BHja,Hj->BHa', k ,unnormlized_decay_mask[:,-1]).detach() if normlize_for_stable else None #(B,H,C1)
         if past_key_value is not None:
             assert "unnormlized_kv" in past_key_value
             if normlize_for_stable: assert past_key_value["unnormlized_gk"] is not None
             numerator   = numerator   + torch.einsum('BHia,BHab,Hi->BHib',q,past_key_value["unnormlized_kv"],chunk_gamma)
             #(B,H,C1,D2)=(B,H,C1,D2)  + (B,H,C1,D1)@(B,H,D1,D2)@(H, C1)->(B,H,C1,D2) 
-            last_unnormlized_kv = last_unnormlized_kv + torch.einsum('BHab,H->BHab',past_key_value["unnormlized_kv"],chunk_gamma[:,-1])
+            if not only_output:last_unnormlized_kv = last_unnormlized_kv + torch.einsum('BHab,H->BHab',past_key_value["unnormlized_kv"],chunk_gamma[:,-1])
             
             if past_key_value["unnormlized_gk"] is not None:
                 denominator = denominator + torch.einsum('BHia,BHa,Hi->BHi'  ,q,past_key_value["unnormlized_gk"],chunk_gamma) #(B,H,C1)
                 # (B,H,C1) =  (B,H,C1)   + #(B,H,C1,D1)@(B,H,D1)@(H, C1)->(B,H,C1) 
-                last_unnormlized_gk = last_unnormlized_gk + torch.einsum( 'BHa,H->BHa' ,past_key_value["unnormlized_gk"],chunk_gamma[:,-1])
+                if not only_output:last_unnormlized_gk = last_unnormlized_gk + torch.einsum( 'BHa,H->BHa' ,past_key_value["unnormlized_gk"],chunk_gamma[:,-1])
         numerator  = numerator
-        denominator= denominator.abs().clamp(min=1).unsqueeze(-1) if denominator is not None else 1
+        if denominator is not None:
+            if isinstance(denominator, float):
+                denominator = denominator
+            else:
+                denominator = denominator.abs().clamp(min=1).unsqueeze(-1)
+        else:
+            denominator = 1
         output = numerator/denominator
 
         output = output.permute(0,2,1,3)
-        cache = {"unnormlized_kv": last_unnormlized_kv, 
-                "unnormlized_gk": last_unnormlized_gk, 
+        cache = {"unnormlized_kv": last_unnormlized_kv if not only_output else None, 
+                 "unnormlized_gk": last_unnormlized_gk if not only_output else None, 
                 "normlize_scale": current_scale # <-- used for check flow correct
                 }
         #output = self.group_norm(output).reshape(output.size(0), -1, self.value_dim)
@@ -604,8 +695,7 @@ class SelfRetentionV2(nn.Module):
     def qk_first_forward(q, k, v,
                          decay_system,
                          past_key_value=None,
-                         retention_mask=None,
-                         forward_impl='parallel',
+                         retention_mask=None,only_output=False,
                          normlize_for_stable=True):
         """
         q,    # (B,H,C1,D1)
@@ -622,7 +712,7 @@ class SelfRetentionV2(nn.Module):
         """
         # (b, h, v_dim, qk_dim)
 
-        chunk_gamma, unnormlized_decay_mask, mask_normlizer = decay_system
+        chunk_gamma, unnormlized_decay_mask, mask_normlizer, Coef_Q, Coef_K= decay_system
         H, C1, C2 = unnormlized_decay_mask.shape
         q = q/mask_normlizer.view(1, H, C1, 1)
         
@@ -630,38 +720,55 @@ class SelfRetentionV2(nn.Module):
         #normlized_qk = torch.einsum('BHia,BHja->BHij', q, k)*unnormlized_decay_mask.view(1, H, C1, C2)
         #numerator = torch.einsum('BHij,BHjc->BHic', normlized_qk, v)
         numerator = normlized_qk@v
-        denominator = normlized_qk.detach().sum(-1) if normlize_for_stable else None  # (B,H,C1)
+        if normlize_for_stable:
+            if isinstance(normlize_for_stable, float) and normlize_for_stable > 0 :
+                denominator = normlize_for_stable
+            else:
+                denominator = normlized_qk.detach().sum(-1)  #(B,H,C1)
+        else:
+            denominator = None
+        # denominator = normlized_qk.detach().sum(-1) if normlize_for_stable else None  # (B,H,C1)
         # let the norm be directly assigned by decay_system is designed.
         current_scale = mask_normlizer
 
         #last_unnormlized_kv = torch.einsum('BHja,Hj,BHjc->BHac', k, unnormlized_decay_mask[:, -1], v)  # (B, H ,D1, D2)
         #last_unnormlized_gk = torch.einsum('BHja,Hj->BHa', k, unnormlized_decay_mask[:, -1]).detach() if normlize_for_stable else None  # (B,H,C1)
         k = k*(unnormlized_decay_mask[:, -1].view(1,H,C2,1))
-        last_unnormlized_gk = k.detach().sum(-2) if normlize_for_stable else None #(B,H,C1)
-        last_unnormlized_kv = k.mT@v 
+        if not only_output:last_unnormlized_gk = k.detach().sum(-2) if normlize_for_stable else None #(B,H,C1)
+        if not only_output:last_unnormlized_kv = k.mT@v 
         if past_key_value is not None:
             assert "unnormlized_kv" in past_key_value
-            if normlize_for_stable:assert past_key_value["unnormlized_gk"] is not None
+            if normlize_for_stable:assert past_key_value["unnormlized_gk"] is not None, """
+            if you are in testing, this usually mean the last step is under only_output=True. 
+            Notice for training and parallel mode, we don't want to do extra computation about the last_unnormlized_kv
+            """
             q = q*chunk_gamma.view(1,H,C1,1)
             #numerator = numerator + torch.einsum('BHia,BHab,Hi->BHib', q,past_key_value["unnormlized_kv"], chunk_gamma)
             numerator = numerator + q@past_key_value["unnormlized_kv"]
             #(B,H,C1,D2)=(B,H,C1,D2)  + (B,H,C1,D1)@(B,H,D1,D2)@(H, C1)->(B,H,C1,D2)
             #last_unnormlized_kv = last_unnormlized_kv + torch.einsum('BHab,H->BHab', past_key_value["unnormlized_kv"], chunk_gamma[:, -1])
-            last_unnormlized_kv = last_unnormlized_kv + past_key_value["unnormlized_kv"]*chunk_gamma[:, -1].view(1,H,1,1)
+            if not only_output:last_unnormlized_kv = last_unnormlized_kv + past_key_value["unnormlized_kv"]*chunk_gamma[:, -1].view(1,H,1,1)
 
             if past_key_value["unnormlized_gk"] is not None:
                 # denominator = denominator + torch.einsum('BHia,BHa,Hi->BHi', q, past_key_value["unnormlized_gk"], chunk_gamma)  # (B,H,C1)
                 denominator = denominator + (q@past_key_value["unnormlized_gk"][...,None])[...,0]
                 # (B,H,C1) =  (B,H,C1)   + #(B,H,C1,D1)@(B,H,D1)@(H, C1)->(B,H,C1)
                 #last_unnormlized_gk = last_unnormlized_gk + torch.einsum('BHa,H->BHa', past_key_value["unnormlized_gk"], chunk_gamma[:, -1])
-                last_unnormlized_gk = last_unnormlized_gk + past_key_value["unnormlized_gk"]*chunk_gamma[:, -1].view(1,H,1)
+                if not only_output:last_unnormlized_gk = last_unnormlized_gk + past_key_value["unnormlized_gk"]*chunk_gamma[:, -1].view(1,H,1)
         numerator = numerator
-        denominator = denominator.abs().clamp(min=1).unsqueeze(-1) if denominator is not None else 1
+        if denominator is not None:
+            if isinstance(denominator, float):
+                denominator = denominator
+            else:
+                denominator = denominator.abs().clamp(min=1).unsqueeze(-1)
+        else:
+            denominator = 1
+
         output = numerator/denominator
 
         output = output.permute(0, 2, 1, 3)
-        cache = {"unnormlized_kv": last_unnormlized_kv,
-                 "unnormlized_gk": last_unnormlized_gk,
+        cache = {"unnormlized_kv": last_unnormlized_kv if not only_output else None,
+                 "unnormlized_gk": last_unnormlized_gk if not only_output else None,
                  "normlize_scale": current_scale  # <-- used for check flow correct
                  }
         #output = self.group_norm(output).reshape(output.size(0), -1, self.value_dim)
@@ -671,9 +778,8 @@ class SelfRetentionV2(nn.Module):
     def readbale_kv_first_forward(q, k, v,
                          decay_system,
                          past_key_value=None,
-                         retention_mask=None,
-                         forward_impl='parallel',
-                         normlize_for_stable=True):
+                         retention_mask=None,only_output=False,
+                         normlize_for_stable=True,output_increment=False):
         """
         q,    # (B,H,C1,D1)
         k,    # (B,H,C1,D1)
@@ -688,11 +794,14 @@ class SelfRetentionV2(nn.Module):
         """
         # (b, h, v_dim, qk_dim)
         
-        chunk_gamma, unnormlized_decay_mask, mask_normlizer = decay_system
+        chunk_gamma, unnormlized_decay_mask, mask_normlizer, Coef_Q, Coef_K= decay_system
         B,H,C1,D1 = q.shape
         B,H,C2,D2 = v.shape
         H, C1, C2 = unnormlized_decay_mask.shape
-
+        increment=None
+        increment=None 
+        if output_increment:
+            increment = get_output_increment(k,v, output_increment)
         unnormlized_kv = torch.einsum('BHja,Hij,BHjc->BHiac', k, unnormlized_decay_mask, v)  # (B, H ,D1, D2)
         unnormlized_gk = torch.einsum('BHja,Hij->BHia'     , k, unnormlized_decay_mask).detach() if normlize_for_stable else None  # (B, H ,1, D1) -> (B, H, D1)
 
@@ -719,15 +828,16 @@ class SelfRetentionV2(nn.Module):
                  "normlize_scale": current_scale  # <-- used for check flow correct
                  }
         #output = self.group_norm(output).reshape(output.size(0), -1, self.value_dim)
-        return output, cache
+        return output, cache,increment
 
     @staticmethod
     def kv_first_forward(q, k, v,
                          decay_system,
                          past_key_value=None,
-                         retention_mask=None,
-                         forward_impl='parallel',
-                         normlize_for_stable=True):
+                         retention_mask=None,only_output=False,
+                         normlize_for_stable=True,
+                         output_increment=False):
+        assert isinstance(normlize_for_stable,bool), "normlize_for_stable must be bool for kv first mode"
         """
         q,    # (B,H,C1,D1)
         k,    # (B,H,C1,D1)
@@ -742,13 +852,16 @@ class SelfRetentionV2(nn.Module):
         """
         # (b, h, v_dim, qk_dim)
         
-        chunk_gamma, unnormlized_decay_mask, mask_normlizer = decay_system
+        chunk_gamma, unnormlized_decay_mask, mask_normlizer, Coef_Q, Coef_K= decay_system
         B,H,C1,D1 = q.shape
         B,H,C2,D2 = v.shape
         H, C1, C2 = unnormlized_decay_mask.shape
 
         #unnormlized_kv = torch.einsum('BHja,Hij,BHjc->BHiac', k, unnormlized_decay_mask, v)  # (B, H ,D1, D2)
         unnormlized_kv = k.unsqueeze(-1)*v.unsqueeze(-2) # (B,H,C2, D1, 1)*(B,H,C2,1,D2) -> (B,H,C2,D1,D2)
+        increment=None 
+        if output_increment:
+            increment = get_output_increment(k,v, output_increment, unnormlized_kv)
         unnormlized_kv = torch.einsum('BHjac,Hij->BHiac', unnormlized_kv, unnormlized_decay_mask)  
         #unnormlized_gk = torch.einsum('BHja,Hij->BHia'  , k, unnormlized_decay_mask).detach() if normlize_for_stable else None  # (B, H ,1, D1) -> (B, H, D1)
         unnormlized_gk =  unnormlized_decay_mask @(k.detach())  if normlize_for_stable else None  # (B, H ,1, D1) -> (B, H, D1)
@@ -783,8 +896,173 @@ class SelfRetentionV2(nn.Module):
                  "normlize_scale": current_scale  # <-- used for check flow correct
                  }
         #output = self.group_norm(output).reshape(output.size(0), -1, self.value_dim)
+        return output, cache,increment
+
+    @staticmethod
+    def kv_reduce_forward(q, k, v,
+                         decay_system,
+                         past_key_value=None,
+                         retention_mask=None,only_output=False,
+                         normlize_for_stable=True):
+        """
+        q_bar_coef = omask[...,:,0]/omask.sum(dim=-1).sqrt()
+        k_bar_coef = 1/(omask[...,:,0])#<----this will overflow~~~~!!!!
+        q_bar = q_bar_coef[...,None]*q
+        k_bar = k_bar_coef[...,None]*k
+        T = torch.cumsum(k_bar,dim=-2)
+        P = torch.einsum('BHia,BHia->BHi', T,q_bar)
+        P = P[...,None].detach().abs().clamp(min=1)
+        q_bar = q_bar/P
+        D = torch.einsum('BHia,BHic->BHiac',k_bar, v)
+        D = torch.cumsum(D,dim=-3)
+        O = torch.einsum('BHia,BHiac->BHic',q_bar,D)
+        ------------------------------------------------------------------
+        """
+        # (b, h, v_dim, qk_dim)
+        chunk_gamma, unnormlized_decay_mask, mask_normlizer, Coef_Q, Coef_K= decay_system
+        
+        B,H,C1,D1 = q.shape
+        B,H,C2,D2 = v.shape
+        H, C1, C2 = unnormlized_decay_mask.shape
+        assert C1 == C2
+        decay_mask = unnormlized_decay_mask[...,0]
+        q = q
+        k = k/decay_mask.view(1, H, C1, 1)
+        unnormlized_kv  = decay_mask.view(1, H, C1, 1, 1)*torch.cumsum(k.unsqueeze(-1)*v.unsqueeze(-2),dim=-3)
+        unnormlized_gk  = decay_mask.view(1, H, C1, 1)*torch.cumsum(k.detach(),dim=-2) if normlize_for_stable else None  # (B, H ,1, D1) -> (B, H, D1)
+
+        
+        # let the norm be directly assigned by decay_system is designed.
+        current_scale = mask_normlizer
+        if past_key_value is not None:
+            assert "unnormlized_kv" in past_key_value
+            if normlize_for_stable:assert past_key_value["unnormlized_gk"] is not None
+            # we need firstly revert the nomrlized_kv to unnormlized_kv by mutiple the scale
+            # current_scale= ((past_key_value["normlize()_scale"]**2) * decay + 1  ).sqrt
+            # print("normlizer_error",torch.dist(mask_normlizer,((past_key_value["normlize_scale"]**2) * normlized_decay_mask + 1  ).sqrt()))
+            #unnormlized_kv = unnormlized_kv + torch.einsum('BHab,Hi->BHiab',past_key_value["unnormlized_kv"], chunk_gamma) 
+            unnormlized_kv = unnormlized_kv + past_key_value["unnormlized_kv"].view(B,H,1,D1,D2)*chunk_gamma.view(1,H,C1,1,1)
+            if past_key_value["unnormlized_gk"] is not None:
+                #unnormlized_gk = unnormlized_gk + torch.einsum('BHa,Hi->BHia',  past_key_value["unnormlized_gk"], chunk_gamma)  is not None else None
+                unnormlized_gk = unnormlized_gk + past_key_value["unnormlized_gk"].view(B,H,1,D1)*chunk_gamma.view(1,H,C1,1)
+            else:
+                unnormlized_gk = None
+
+        q = q/mask_normlizer.view(1, H, C1, 1)
+        # torch.sum(q * current_kv, dim=3).unsqueeze(1)  # (B, 1,H, D2)
+        # numerator   = torch.einsum("BHia,BHiab->BHib", q, unnormlized_kv)
+        numerator = (q.unsqueeze(-2)@unnormlized_kv).squeeze(-2)
+        #denominator = torch.einsum("BHia,BHia ->BHi",  q.detach(), unnormlized_gk).abs().clamp(min=1).unsqueeze(-1) if unnormlized_gk is not None else 1
+        denominator = (q.detach()*unnormlized_gk).sum(-1) if unnormlized_gk is not None else None
+        denominator = denominator.abs().clamp(min=1).unsqueeze(-1) if denominator is not None else 1
+        output = numerator/denominator  # (B,H,C,D2)/(B,H,C,1)
+        output = output.permute(0, 2, 1, 3)
+        cache = {"unnormlized_kv": unnormlized_kv[:, :, -1],
+                 "unnormlized_gk": unnormlized_gk[:, :, -1] if unnormlized_gk is not None else None ,
+                 "normlize_scale": current_scale  # <-- used for check flow correct
+                 }
+        #output = self.group_norm(output).reshape(output.size(0), -1, self.value_dim)
         return output, cache
 
+    @staticmethod
+    def kv_reduce_fast_forward(q, k, v,
+                         decay_system,
+                         past_key_value=None,
+                         retention_mask=None,only_output=False,
+                         normlize_for_stable=True):
+        """
+        q_bar_coef = omask[...,:,0]/omask.sum(dim=-1).sqrt()
+        k_bar_coef = 1/(omask[...,:,0])#<----this will overflow~~~~!!!!
+        q_bar = q_bar_coef[...,None]*q
+        k_bar = k_bar_coef[...,None]*k
+        T = torch.cumsum(k_bar,dim=-2)
+        P = torch.einsum('BHia,BHia->BHi', T,q_bar)
+        P = P[...,None].detach().abs().clamp(min=1)
+        q_bar = q_bar/P
+        D = torch.einsum('BHia,BHic->BHiac',k_bar, v)
+        D = torch.cumsum(D,dim=-3)
+        O = torch.einsum('BHia,BHiac->BHic',q_bar,D)
+        ------------------------------------------------------------------
+        """
+        # (b, h, v_dim, qk_dim)
+        assert past_key_value is None, "kv_reduce_fast_forward only work for the parallel mode"
+        chunk_gamma, unnormlized_decay_mask, mask_normlizer, Coef_Q, Coef_K= decay_system
+        
+        B,H,C1,D1 = q.shape
+        B,H,C2,D2 = v.shape
+        H, C1, C2 = unnormlized_decay_mask.shape
+        assert C1 == C2
+        q = q*Coef_Q.view(1,H,C1,1)
+        k = k*Coef_K.view(1,H,C2,1)
+        q = q/mask_normlizer.view(1, H, C1, 1)
+
+        if normlize_for_stable:
+            if isinstance(normlize_for_stable, float) and normlize_for_stable > 0 :
+                denominator = normlize_for_stable
+            else:
+                unnormlized_gk = torch.cumsum(k.detach(),dim=-2)
+                denominator = (q.detach()*unnormlized_gk).sum(-1).abs().clamp(min=1).unsqueeze(-1)
+            
+        else:
+            denominator = 1
+        unnormlized_kv  = torch.cumsum(k.unsqueeze(-1)*v.unsqueeze(-2),dim=-3)
+        numerator       = (q.unsqueeze(-2)@unnormlized_kv).squeeze(-2)
+        
+        output = numerator/denominator  # (B,H,C,D2)/(B,H,C,1)
+        output = output.permute(0, 2, 1, 3)
+        cache = {"unnormlized_kv": None,
+                 "unnormlized_gk": None ,
+                 "normlize_scale": None  # <-- used for check flow correct
+                 }
+        #output = self.group_norm(output).reshape(output.size(0), -1, self.value_dim)
+        return output, cache
+
+    def chain_forward(self,q, k, v,
+                         decay_system,
+                         past_key_value=None,
+                         retention_mask=None,only_output=False,
+                         normlize_for_stable=True):
+        """
+        B,H,S1,D1 = q.shape
+        B,H,S2,D1 = k.shape
+        B,H,S2,D2 = v.shape
+        name = f"{B}.{H}.{S1}.{S2}.{D1}.{D2}"
+
+        if name not in self.best_contract_path:
+            self.best_contract_path[name] = oe.contract_path('BHia,Hij,BHja,BHjc->BHic',q, mask, k, v, optimize='random-greedy-128')[0]
+        output = contract('BHia,Hij,BHja,BHjc->BHic',q, mask, k, v,optimize=self.best_contract_path[name])
+        ------------------------------------------------------------------
+        """
+        # (b, h, v_dim, qk_dim)
+        assert isinstance(normlize_for_stable,float) and self.training, "you must assign a normlize_for_stable for chain mode "
+        if not self.training: normlize_for_stable = 1
+        assert normlize_for_stable>0, "normlize_for_stable must big than 0 "
+        assert past_key_value is None, "chain mode only support train mode which past_key_value must be None"
+        chunk_gamma, unnormlized_decay_mask, mask_normlizer, Coef_Q, Coef_K= decay_system
+        
+        B,H,S1,D1 = q.shape
+        B,H,S2,D1 = k.shape
+        B,H,S2,D2 = v.shape
+        H, C1, C2 = unnormlized_decay_mask.shape
+        mask = unnormlized_decay_mask/mask_normlizer.view(H, C1, 1)
+        name = f"{B}.{H}.{S1}.{S2}.{D1}.{D2}"
+
+        if name not in self.best_contract_path:
+            self.best_contract_path[name] = oe.contract_path('BHia,Hij,BHja,BHjc->BHic',q, mask, k, v, optimize='random-greedy-128')[0]
+        
+        q = q/np.sqrt(normlize_for_stable)
+        k = k/np.sqrt(normlize_for_stable)
+        output = contract('BHia,Hij,BHja,BHjc->BHic',q, mask, k, v,optimize=self.best_contract_path[name])
+        current_scale = mask_normlizer
+        
+        output = output.permute(0, 2, 1, 3)
+        cache = {"unnormlized_kv": None,
+                 "unnormlized_gk": None,
+                 "normlize_scale": current_scale  # <-- used for check flow correct
+                 }
+        #output = self.group_norm(output).reshape(output.size(0), -1, self.value_dim)
+        return output, cache
+   
 
 
 if __name__ == "__main__":
@@ -792,7 +1070,7 @@ if __name__ == "__main__":
     from configuration_retnet import RetNetConfig
     from tqdm.auto import tqdm
     import time
-    def meta_test(q,k,v,retnet_rel_pos1, model1,
+    def atom_test(q,k,v,retnet_rel_pos1, model1,
                   retnet_rel_pos2, model2,
                   use_gk = True,
                   mode   = 'qk_first'):
@@ -800,8 +1078,8 @@ if __name__ == "__main__":
         (cos,sin), decay_system = retnet_rel_pos1(S,forward_impl='parallel')
         parallel_output = model1(q,k,v,decay_system)[0]
 
-        (cos,sin), (chunk_gamma, unnormlized_decay_mask,mask_normlizer) = retnet_rel_pos2(S,recurrent_chunk_size=S,forward_impl='chunkwise_recurrent')
-        chunkwise_output,_,chunkwise_cache =  model2(q,k,v,(chunk_gamma, unnormlized_decay_mask,mask_normlizer),normlize_for_stable=use_gk,mode=mode)
+        (cos,sin), decay_system = retnet_rel_pos2(S,recurrent_chunk_size=S,forward_impl='chunkwise_recurrent')
+        chunkwise_output,_,chunkwise_cache =  model2(q,k,v,decay_system,normlize_for_stable=use_gk,mode=mode)[:3]
         print("     ================= whole chunk size S=S test ====================")
         print(f"     error before group_norm {torch.dist(parallel_output,chunkwise_output):.3f}")
         print(f"     error after  group_norm {torch.dist(group_norm(parallel_output),group_norm(chunkwise_output)):.3f}")
@@ -809,11 +1087,11 @@ if __name__ == "__main__":
         past_kv = None
         full_rnn_state = []
         for i in range(0,S):
-            (cos,sin), (chunk_gamma, unnormlized_decay_mask,mask_normlizer) = retnet_rel_pos2(i+1,recurrent_chunk_size=1,forward_impl='chunkwise_recurrent')
+            (cos,sin), decay_system = retnet_rel_pos2(i+1,recurrent_chunk_size=1,forward_impl='chunkwise_recurrent')
             one_step_output, _, past_kv = model2(q[:,:,i:i+1],k[:,:,i:i+1],v[:,:,i:i+1],
-                                                                (chunk_gamma, unnormlized_decay_mask,mask_normlizer),
+                                                                decay_system,
                                                                 past_key_value= past_kv,
-                                                                normlize_for_stable=use_gk, mode=mode)
+                                                                normlize_for_stable=use_gk, mode=mode)[:3]
             #print(past_kv['normlize_scale'].squeeze()[:2].cpu().numpy())
             full_rnn_state.append(one_step_output)
         full_rnn_state = torch.cat(full_rnn_state, dim=1)
@@ -823,17 +1101,17 @@ if __name__ == "__main__":
         print("     ================= parallel+rnn chunk size=3 test ====================")
         offset = 3
         past_kv= None
-        (cos,sin), (chunk_gamma, unnormlized_decay_mask,mask_normlizer) = retnet_rel_pos2(S-offset,recurrent_chunk_size=S-offset,forward_impl='chunkwise_recurrent')
+        (cos,sin), decay_system = retnet_rel_pos2(S-offset,recurrent_chunk_size=S-offset,forward_impl='chunkwise_recurrent')
         start_output, _, start_cache =  model2(q[:,:,:-offset],k[:,:,:-offset],v[:,:,:-offset],
-                                                                (chunk_gamma, unnormlized_decay_mask,mask_normlizer),
+                                                                decay_system,
                                                                 past_key_value= past_kv,
-                                            normlize_for_stable=use_gk, mode=mode)
+                                            normlize_for_stable=use_gk, mode=mode)[:3]
 
-        (cos,sin), (chunk_gamma, unnormlized_decay_mask,mask_normlizer) = retnet_rel_pos2(S,recurrent_chunk_size=offset,forward_impl='chunkwise_recurrent')
+        (cos,sin), decay_system = retnet_rel_pos2(S,recurrent_chunk_size=offset,forward_impl='chunkwise_recurrent')
         next_output, _, next_cache =  model2(q[:,:,-offset:],k[:,:,-offset:],v[:,:,-offset:],
-                                                            (chunk_gamma, unnormlized_decay_mask,mask_normlizer),
+                                                            decay_system,
                                                             past_key_value= start_cache,
-                                                            normlize_for_stable=use_gk, mode=mode)
+                                                            normlize_for_stable=use_gk, mode=mode)[:3]
         rnn_output = torch.cat([start_output, next_output],1)
         print(f"     error of start element  {torch.dist(parallel_output[:,:-offset], start_output):.3f}")
         print(f"     error before group_norm {torch.dist(parallel_output,rnn_output):.3f}")
@@ -849,12 +1127,12 @@ if __name__ == "__main__":
             qm = q[:,:,last:i]
             km = k[:,:,last:i]
             vm = v[:,:,last:i]
-            (cos, sin), (chunk_gamma, unnormlized_decay_mask, mask_normlizer) = retnet_rel_pos2(
+            (cos, sin), decay_system = retnet_rel_pos2(
                 i, recurrent_chunk_size=qm.shape[-2], forward_impl='chunkwise_recurrent')
             one_step_output, _, past_kv = model2(qm, km, vm,
-                                                (chunk_gamma, unnormlized_decay_mask,mask_normlizer),
+                                                decay_system,
                                                 past_key_value= past_kv,
-                                              normlize_for_stable=use_gk, mode=mode)
+                                              normlize_for_stable=use_gk, mode=mode)[:3]
             full_rnn_state.append(one_step_output)
             last = i
         full_rnn_state = torch.cat(full_rnn_state, dim=1)
@@ -865,9 +1143,9 @@ if __name__ == "__main__":
         past_kv = None
         full_rnn_state = []
         for i in range(0,S):
-            (cos,sin), (chunk_gamma, unnormlized_decay_mask,mask_normlizer) = retnet_rel_pos(i+1,recurrent_chunk_size=1,forward_impl='chunkwise_recurrent')
+            (cos,sin), decay_system = retnet_rel_pos(i+1,recurrent_chunk_size=1,forward_impl='chunkwise_recurrent')
             one_step_output, _, past_kv = model(q[:,:,i:i+1],k[:,:,i:i+1],v[:,:,i:i+1],
-                                                                (chunk_gamma, unnormlized_decay_mask,mask_normlizer),
+                                                                decay_system,
                                                                 past_key_value= past_kv,
                                                                 normlize_for_stable=use_gk, mode=mode)
             #print(past_kv['normlize_scale'].squeeze()[:2].cpu().numpy())
@@ -910,83 +1188,119 @@ if __name__ == "__main__":
     retnet_rel_posV1 = RetNetRelPosV1(config).cuda()
     retnet_rel_posV2 = RetNetRelPosV2(config).cuda()
 
+    # print("===================================================================================")
+    # print("================= check the timecost among different mode [qk] ====================")
+    # print("===================================================================================")
+    # fqk_first_with_gk = timecost_profile(whole_recurrent, q, k, v, retnet_rel_posV2, retention_v2, use_gk=True , mode='qk_first')
+    # fqk_first_wito_gk = timecost_profile(whole_recurrent, q, k, v, retnet_rel_posV2, retention_v2, use_gk=False, mode='qk_first')
+    # rqk_first_with_gk = timecost_profile(whole_recurrent, q, k, v, retnet_rel_posV2, retention_v2, use_gk=True , mode='readable_qk_first')
+    # rqk_first_wito_gk = timecost_profile(whole_recurrent, q, k, v, retnet_rel_posV2, retention_v2, use_gk=False, mode='readable_qk_first')
+    
+    # print("================= check the consistancy between different mode [before group norm] ====================")
+    # print(f"fast qk + gk <=> fast qk - gk:{torch.dist(fqk_first_with_gk,fqk_first_wito_gk).item():.4f}")
+    # print(f"fast qk + gk <=> read qk + gk:{torch.dist(fqk_first_with_gk,rqk_first_with_gk).item():.4f}")
+    # print(f"fast qk + gk <=> read qk - gk:{torch.dist(fqk_first_with_gk,rqk_first_wito_gk).item():.4f}")
+    # print(f"fast qk - gk <=> read qk - gk:{torch.dist(fqk_first_wito_gk,rqk_first_wito_gk).item():.4f}")
+    # print("================= check the consistancy between different mode [after group norm] ====================")
+    # print(f"fast qk + gk <=> fast qk - gk:{torch.dist(group_norm(fqk_first_with_gk),group_norm(fqk_first_wito_gk)).item():.4f}")
+    # print(f"fast qk + gk <=> read qk + gk:{torch.dist(group_norm(fqk_first_with_gk),group_norm(rqk_first_with_gk)).item():.4f}")
+    # print(f"fast qk + gk <=> read qk - gk:{torch.dist(group_norm(fqk_first_with_gk),group_norm(rqk_first_wito_gk)).item():.4f}")
+    # print(f"fast qk - gk <=> read qk - gk:{torch.dist(group_norm(fqk_first_wito_gk),group_norm(rqk_first_wito_gk)).item():.4f}")
+    
+    # print("===================================================================================")
+    # print("================= check the timecost among different mode [kv] ====================")
+    # print("===================================================================================")
+    # fkv_first_with_gk = timecost_profile(whole_recurrent, q, k, v, retnet_rel_posV2, retention_v2, use_gk=True , mode='kv_first')
+    # fkv_first_wito_gk = timecost_profile(whole_recurrent, q, k, v, retnet_rel_posV2, retention_v2, use_gk=False, mode='kv_first')
+    # rkv_first_with_gk = timecost_profile(whole_recurrent, q, k, v, retnet_rel_posV2, retention_v2, use_gk=True , mode='readable_kv_first')
+    # rkv_first_wito_gk = timecost_profile(whole_recurrent, q, k, v, retnet_rel_posV2, retention_v2, use_gk=False, mode='readable_kv_first')
+    
+    # print("================= check the consistancy between different mode [before group norm] ====================")
+    # print(f"fast kv + gk <=> fast kv - gk:{torch.dist(fkv_first_with_gk,fkv_first_wito_gk).item():.4f}")
+    # print(f"fast kv + gk <=> read kv + gk:{torch.dist(fkv_first_with_gk,rkv_first_with_gk).item():.4f}")
+    # print(f"fast kv + gk <=> read kv - gk:{torch.dist(fkv_first_with_gk,rkv_first_wito_gk).item():.4f}")
+    # print(f"fast kv - gk <=> read kv - gk:{torch.dist(fkv_first_wito_gk,rkv_first_wito_gk).item():.4f}")
+    # print("================= check the consistancy between different mode [after group norm] ====================")
+    # print(f"fast kv + gk <=> fast kv - gk:{torch.dist(group_norm(fkv_first_with_gk),group_norm(fkv_first_wito_gk)).item():.4f}")
+    # print(f"fast kv + gk <=> read kv + gk:{torch.dist(group_norm(fkv_first_with_gk),group_norm(rkv_first_with_gk)).item():.4f}")
+    # print(f"fast kv + gk <=> read kv - gk:{torch.dist(group_norm(fkv_first_with_gk),group_norm(rkv_first_wito_gk)).item():.4f}")
+    # print(f"fast kv - gk <=> read kv - gk:{torch.dist(group_norm(fkv_first_wito_gk),group_norm(rkv_first_wito_gk)).item():.4f}")
+    
+    # print("===================================================================================")
+    # print("================= check the timecost among different mode [kv] ====================")
+    # print("===================================================================================")
+    # fkv_first_with_gk = timecost_profile(whole_recurrent, q, k, v, retnet_rel_posV2, retention_v2, use_gk=True , mode='kv_first')
+    # fkv_first_wito_gk = timecost_profile(whole_recurrent, q, k, v, retnet_rel_posV2, retention_v2, use_gk=False, mode='kv_first')
+    # rkv_first_with_gk = timecost_profile(whole_recurrent, q, k, v, retnet_rel_posV2, retention_v2, use_gk=True , mode='kv_reduce')
+    # rkv_first_wito_gk = timecost_profile(whole_recurrent, q, k, v, retnet_rel_posV2, retention_v2, use_gk=False, mode='kv_reduce')
+    
+    # print("================= check the consistancy between different mode [before group norm] ====================")
+    # print(f"fast kv + gk <=> fast kv - gk:{torch.dist(fkv_first_with_gk,fkv_first_wito_gk).item():.4f}")
+    # print(f"fast kv + gk <=> redu kv + gk:{torch.dist(fkv_first_with_gk,rkv_first_with_gk).item():.4f}")
+    # print(f"fast kv + gk <=> redu kv - gk:{torch.dist(fkv_first_with_gk,rkv_first_wito_gk).item():.4f}")
+    # print(f"fast kv - gk <=> redu kv - gk:{torch.dist(fkv_first_wito_gk,rkv_first_wito_gk).item():.4f}")
+    # print("================= check the consistancy between different mode [after group norm] ====================")
+    # print(f"fast kv + gk <=> fast kv - gk:{torch.dist(group_norm(fkv_first_with_gk),group_norm(fkv_first_wito_gk)).item():.4f}")
+    # print(f"fast kv + gk <=> redu kv + gk:{torch.dist(group_norm(fkv_first_with_gk),group_norm(rkv_first_with_gk)).item():.4f}")
+    # print(f"fast kv + gk <=> redu kv - gk:{torch.dist(group_norm(fkv_first_with_gk),group_norm(rkv_first_wito_gk)).item():.4f}")
+    # print(f"fast kv - gk <=> redu kv - gk:{torch.dist(group_norm(fkv_first_wito_gk),group_norm(rkv_first_wito_gk)).item():.4f}")
+    
+    # (cos,sin), (decay_mask,intra_decay, scale,gamma, L) = retnet_rel_posV1(S,forward_impl='parallel')
+    # parallel_output_origin, _ , _ = retention_origin(q, k, v, (decay_mask, intra_decay, scale, gamma, L), past_key_value=None,forward_impl='parallel')
 
-    print("================= check the timecost among different mode [qk] ====================")
-    fqk_first_with_gk = timecost_profile(whole_recurrent, q, k, v, retnet_rel_posV2, retention_v2, use_gk=True , mode='qk_first')
-    fqk_first_wito_gk = timecost_profile(whole_recurrent, q, k, v, retnet_rel_posV2, retention_v2, use_gk=False, mode='qk_first')
-    rqk_first_with_gk = timecost_profile(whole_recurrent, q, k, v, retnet_rel_posV2, retention_v2, use_gk=True , mode='readable_qk_first')
-    rqk_first_wito_gk = timecost_profile(whole_recurrent, q, k, v, retnet_rel_posV2, retention_v2, use_gk=False, mode='readable_qk_first')
+    # (cos, sin), decay_system = retnet_rel_posV2(S, forward_impl='parallel')
+    # parallel_output_qk_with_gk,_, parallel_cache =  retention_v2(q,k,v,decay_system,mode='qk_first',normlize_for_stable=True)
+    # parallel_output_qk_wito_gk,_, parallel_cache =  retention_v2(q,k,v,decay_system,mode='qk_first',normlize_for_stable=False)
     
-    print("================= check the consistancy between different mode [before group norm] ====================")
-    print(f"fast qk + gk <=> fast qk - gk:{torch.dist(fqk_first_with_gk,fqk_first_wito_gk).item():.4f}")
-    print(f"fast qk + gk <=> read qk + gk:{torch.dist(fqk_first_with_gk,rqk_first_with_gk).item():.4f}")
-    print(f"fast qk + gk <=> read qk - gk:{torch.dist(fqk_first_with_gk,rqk_first_wito_gk).item():.4f}")
-    print(f"fast qk - gk <=> read qk - gk:{torch.dist(fqk_first_wito_gk,rqk_first_wito_gk).item():.4f}")
-    print("================= check the consistancy between different mode [after group norm] ====================")
-    print(f"fast qk + gk <=> fast qk - gk:{torch.dist(group_norm(fqk_first_with_gk),group_norm(fqk_first_wito_gk)).item():.4f}")
-    print(f"fast qk + gk <=> read qk + gk:{torch.dist(group_norm(fqk_first_with_gk),group_norm(rqk_first_with_gk)).item():.4f}")
-    print(f"fast qk + gk <=> read qk - gk:{torch.dist(group_norm(fqk_first_with_gk),group_norm(rqk_first_wito_gk)).item():.4f}")
-    print(f"fast qk - gk <=> read qk - gk:{torch.dist(group_norm(fqk_first_wito_gk),group_norm(rqk_first_wito_gk)).item():.4f}")
-    
-    print("================= check the timecost among different mode [kv] ====================")
-    fkv_first_with_gk = timecost_profile(whole_recurrent, q, k, v, retnet_rel_posV2, retention_v2, use_gk=True , mode='kv_first')
-    fkv_first_wito_gk = timecost_profile(whole_recurrent, q, k, v, retnet_rel_posV2, retention_v2, use_gk=False, mode='kv_first')
-    rkv_first_with_gk = timecost_profile(whole_recurrent, q, k, v, retnet_rel_posV2, retention_v2, use_gk=True , mode='readable_kv_first')
-    rkv_first_wito_gk = timecost_profile(whole_recurrent, q, k, v, retnet_rel_posV2, retention_v2, use_gk=False, mode='readable_kv_first')
-    
-    print("================= check the consistancy between different mode [before group norm] ====================")
-    print(f"fast kv + gk <=> fast kv - gk:{torch.dist(fkv_first_with_gk,fkv_first_wito_gk).item():.4f}")
-    print(f"fast kv + gk <=> read kv + gk:{torch.dist(fkv_first_with_gk,rkv_first_with_gk).item():.4f}")
-    print(f"fast kv + gk <=> read kv - gk:{torch.dist(fkv_first_with_gk,rkv_first_wito_gk).item():.4f}")
-    print(f"fast kv - gk <=> read kv - gk:{torch.dist(fkv_first_wito_gk,rkv_first_wito_gk).item():.4f}")
-    print("================= check the consistancy between different mode [after group norm] ====================")
-    print(f"fast kv + gk <=> fast kv - gk:{torch.dist(group_norm(fkv_first_with_gk),group_norm(fkv_first_wito_gk)).item():.4f}")
-    print(f"fast kv + gk <=> read kv + gk:{torch.dist(group_norm(fkv_first_with_gk),group_norm(rkv_first_with_gk)).item():.4f}")
-    print(f"fast kv + gk <=> read kv - gk:{torch.dist(group_norm(fkv_first_with_gk),group_norm(rkv_first_wito_gk)).item():.4f}")
-    print(f"fast kv - gk <=> read kv - gk:{torch.dist(group_norm(fkv_first_wito_gk),group_norm(rkv_first_wito_gk)).item():.4f}")
-    
-    exit()
-    (cos,sin), (decay_mask,intra_decay, scale,gamma, L) = retnet_rel_posV1(S,forward_impl='parallel')
-    parallel_output_origin, _ , _ = retention_origin(q, k, v, (decay_mask, intra_decay, scale, gamma, L), past_key_value=None,forward_impl='parallel')
+    # print("========== check the consistancy between origin implement output and qk version with gk ==========")
+    # print(f" qk + gk <=> origin: before group_norm {torch.dist(parallel_output_qk_with_gk,parallel_output_origin):.3f}")
+    # print(f" qk + gk <=> origin: after  group_norm {torch.dist(group_norm(parallel_output_qk_with_gk),group_norm(parallel_output_origin)):.3f}")
+    # print(f" qk - gk <=> origin: before group_norm {torch.dist(parallel_output_qk_wito_gk,parallel_output_origin):.3f}")
+    # print(f" qk - gk <=> origin: after  group_norm {torch.dist(group_norm(parallel_output_qk_wito_gk),group_norm(parallel_output_origin)):.3f}")
 
-    (cos, sin), (chunk_gamma, unnormlized_decay_mask, mask_normlizer) = retnet_rel_posV2(S, forward_impl='parallel')
-    parallel_output_qk_with_gk,_, parallel_cache =  retention_v2(q,k,v,(chunk_gamma, unnormlized_decay_mask,mask_normlizer),mode='qk_first',normlize_for_stable=True)
-    parallel_output_qk_wito_gk,_, parallel_cache =  retention_v2(q,k,v,(chunk_gamma, unnormlized_decay_mask,mask_normlizer),mode='qk_first',normlize_for_stable=False)
+    # parallel_output_kv_with_gk,_, parallel_cache =  retention_v2(q,k,v,decay_system,mode='kv_first',normlize_for_stable=True)
+    # parallel_output_kv_wito_gk,_, parallel_cache =  retention_v2(q,k,v,decay_system,mode='kv_first',normlize_for_stable=False)
     
-    print("========== check the consistancy between origin implement output and qk version with gk ==========")
-    print(f" qk + gk <=> origin: before group_norm {torch.dist(parallel_output_qk_with_gk,parallel_output_origin):.3f}")
-    print(f" qk + gk <=> origin: after  group_norm {torch.dist(group_norm(parallel_output_qk_with_gk),group_norm(parallel_output_origin)):.3f}")
-    print(f" qk - gk <=> origin: before group_norm {torch.dist(parallel_output_qk_wito_gk,parallel_output_origin):.3f}")
-    print(f" qk - gk <=> origin: after  group_norm {torch.dist(group_norm(parallel_output_qk_wito_gk),group_norm(parallel_output_origin)):.3f}")
+    # print("========== check the consistancy between origin implement output and kv version with gk ==========")
+    # print(f" kv + gk <=> origin: before group_norm {torch.dist(parallel_output_kv_with_gk,parallel_output_origin):.3f}")
+    # print(f" kv + gk <=> origin: after  group_norm {torch.dist(group_norm(parallel_output_kv_with_gk),group_norm(parallel_output_origin)):.3f}")
+    # print(f" kv - gk <=> origin: before group_norm {torch.dist(parallel_output_kv_wito_gk,parallel_output_origin):.3f}")
+    # print(f" kv - gk <=> origin: after  group_norm {torch.dist(group_norm(parallel_output_kv_wito_gk),group_norm(parallel_output_origin)):.3f}")
 
-    parallel_output_kv_with_gk,_, parallel_cache =  retention_v2(q,k,v,(chunk_gamma, unnormlized_decay_mask,mask_normlizer),mode='kv_first',normlize_for_stable=True)
-    parallel_output_kv_wito_gk,_, parallel_cache =  retention_v2(q,k,v,(chunk_gamma, unnormlized_decay_mask,mask_normlizer),mode='kv_first',normlize_for_stable=False)
+    use_gk = True
+    mode   = 'kv_reduce_fast'
+    print(f"============= use_gk:{use_gk} mode:{mode} ==============")
+    atom_test(q,k,v,retnet_rel_posV1, retention_origin,retnet_rel_posV2, retention_v2, use_gk = use_gk, mode=mode)
     
-    print("========== check the consistancy between origin implement output and kv version with gk ==========")
-    print(f" kv + gk <=> origin: before group_norm {torch.dist(parallel_output_kv_with_gk,parallel_output_origin):.3f}")
-    print(f" kv + gk <=> origin: after  group_norm {torch.dist(group_norm(parallel_output_kv_with_gk),group_norm(parallel_output_origin)):.3f}")
-    print(f" kv - gk <=> origin: before group_norm {torch.dist(parallel_output_kv_wito_gk,parallel_output_origin):.3f}")
-    print(f" kv - gk <=> origin: after  group_norm {torch.dist(group_norm(parallel_output_kv_wito_gk),group_norm(parallel_output_origin)):.3f}")
+    use_gk = False
+    mode   = 'kv_reduce_fast'
+    print(f"============= use_gk:{use_gk} mode:{mode} ==============")
+    atom_test(q,k,v,retnet_rel_posV1, retention_origin,retnet_rel_posV2, retention_v2, use_gk = use_gk, mode=mode)
+    
 
-    
     use_gk = True
     mode   = 'qk_first'
     print(f"============= use_gk:{use_gk} mode:{mode} ==============")
-    meta_test(q,k,v,retnet_rel_posV1, retention_origin,retnet_rel_posV2, retention_v2, use_gk = use_gk, mode=mode)
+    atom_test(q,k,v,retnet_rel_posV1, retention_origin,retnet_rel_posV2, retention_v2, use_gk = use_gk, mode=mode)
     
     use_gk = True
     mode   = 'kv_first'
     print(f"============= use_gk:{use_gk} mode:{mode} ==============")
-    meta_test(q,k,v,retnet_rel_posV1, retention_origin,retnet_rel_posV2, retention_v2, use_gk = use_gk, mode=mode)
+    atom_test(q,k,v,retnet_rel_posV1, retention_origin,retnet_rel_posV2, retention_v2, use_gk = use_gk, mode=mode)
 
     use_gk = False
     mode   = 'qk_first'
     print(f"============= use_gk:{use_gk} mode:{mode} ==============")
-    meta_test(q,k,v,retnet_rel_posV1, retention_origin,retnet_rel_posV2, retention_v2, use_gk = use_gk, mode=mode)
+    atom_test(q,k,v,retnet_rel_posV1, retention_origin,retnet_rel_posV2, retention_v2, use_gk = use_gk, mode=mode)
 
     use_gk = False
     mode   = 'kv_first'
     print(f"============= use_gk:{use_gk} mode:{mode} ==============")
-    meta_test(q,k,v,retnet_rel_posV1, retention_origin,retnet_rel_posV2, retention_v2, use_gk = use_gk, mode=mode)
+    atom_test(q,k,v,retnet_rel_posV1, retention_origin,retnet_rel_posV2, retention_v2, use_gk = use_gk, mode=mode)
 
+    use_gk = False
+    mode   = 'kv_reduce'
+    print(f"============= use_gk:{use_gk} mode:{mode} ==============")
+    atom_test(q,k,v,retnet_rel_posV1, retention_origin,retnet_rel_posV2, retention_v2, use_gk = use_gk, mode=mode)
+    
     exit()

@@ -1,9 +1,34 @@
 from einops import rearrange
 import torch
 import torch.nn as nn
-from torch_discounted_cumsum import  discounted_cumsum_left, discounted_cumsum3_left
 import numpy as py
-from torch_discounted_cumsum.discounted_cumsum import qkvg_retention,weighted_cumsum_batch
+
+try:
+    from torch_discounted_cumsum import  discounted_cumsum_left, discounted_cumsum3_left
+    from torch_discounted_cumsum.discounted_cumsum import qkvg_retention,weighted_cumsum_batch
+except:
+    print('discounted_cumsum not found, pass')
+    
+class RMSNorm(nn.Module):
+
+    def __init__(self, dim: int, eps: float = 1e-6, elementwise_affine=True):
+        super().__init__()
+        self.normalized_shape = dim
+        self.eps = eps
+        self.elementwise_affine = elementwise_affine
+        if self.elementwise_affine:
+            self.weight = nn.Parameter(torch.ones(dim))
+        else:
+            self.register_parameter('weight', None)
+
+    def _norm(self, x):
+        return x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + self.eps)
+
+    def forward(self, x):
+        output = self._norm(x.float()).type_as(x)
+        if self.weight is not None:
+            output = output * self.weight
+        return output
 
 class Discounted_Cumsum(nn.Module):
     """
@@ -132,120 +157,186 @@ class ParallelRetention_fast3(nn.Module):
         O     = qkvg_retention(qL,k,v,omask[0])/P
         return O
     
+def rmsenorm(x):
+    return x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + 1e-6)
+
+
 class ParallelRetention_reduce(nn.Module):
     
-    def forward(self, q, k, v, omask,*args,**kargs):
-        q_bar_coef = omask[...,:,0]/omask.sum(dim=-1).sqrt()
-        k_bar_coef = 1/(omask[...,:,0])#<----this will overflow~~~~!!!!
-        q_bar = q_bar_coef[...,None]*q
-        k_bar = k_bar_coef[...,None]*k
-        T = torch.cumsum(k_bar,dim=-2)
-        P = torch.einsum('BHia,BHia->BHi', T,q_bar)
-        P = P[...,None].detach().abs().clamp(min=1)
-        q_bar = q_bar/P
+    def forward(self, q, k, v, omask,  mask_normer, *args, normlized=True,**kargs):
+        Coef_Q,Coef_K,scale = omask
+        B,H,S1,D1 = q.shape
+        B,H,S2,D1 = k.shape
+        B,H,S2,D2 = v.shape
+        q_bar = q*Coef_Q.view(1,H,S1,1)/mask_normer.view(1,H,S1,1)
+        k_bar = k*Coef_K.view(1,H,S2,1)
+        if normlized:
+            T = torch.cumsum(k_bar,dim=-2)
+            P = torch.einsum('BHia,BHia->BHi', T,q_bar)
+            P = P[...,None].detach().abs().clamp(min=1)
+            q_bar = q_bar/P
         D = torch.einsum('BHia,BHic->BHiac',k_bar, v)
         D = torch.cumsum(D,dim=-3)
         O = torch.einsum('BHia,BHiac->BHic',q_bar,D)
+        O = rmsenorm(O)
         return O
 
 class ParallelRetention_origin(nn.Module):
     
     
-    def forward(self, q, k, v, omask,*args,**kargs):
-        mask = omask / omask.sum(dim=-1, keepdim=True).sqrt()
+    def forward(self, q, k, v, omask, mask_normer, *args, normlized=True,**kargs):
+        B,H,S1,D1 = q.shape
+        B,H,S2,D1 = k.shape
+        B,H,S2,D2 = v.shape
+        H,S1 = mask_normer.shape
+        mask = omask / mask_normer.view(1,H,S1,1 )
         mask = torch.nan_to_num(mask, nan=0.0)
         decay_mask = mask
         retention = q @ k.transpose(-1, -2)  # --> (B,H,S,S)
         retention = retention * decay_mask   # --> (B,H,S,S)
-        retention = retention / retention.detach().sum(dim=-1, keepdim=True).abs().clamp(min=1) # --> (B,H,S,S)
+        #retention = retention/2
+        if normlized:retention = retention / retention.detach().sum(dim=-1, keepdim=True).abs().clamp(min=1) # --> (B,H,S,S)
         output = retention @ v  # [b, h, t, v_dim / h] ## # --> (B,H,S,D)
+        output = rmsenorm(output)
         return output
+import opt_einsum as oe    
+from opt_einsum import contract
+class ParallelRetention_plain(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.best_contract_path = {}
 
+    def forward(self, q, k, v, omask,*args, normlized=False,**kargs):
+        assert not normlized
+        mask = omask / omask.sum(dim=-1, keepdim=True).sqrt()
+        mask = torch.nan_to_num(mask, nan=0.0)[0]
+        B,H,S1,D1 = q.shape
+        B,H,S2,D1 = k.shape
+        B,H,S2,D2 = v.shape
+        name = f"{B}.{H}.{S1}.{S2}.{D1}.{D2}"
+
+        if name not in self.best_contract_path:
+            self.best_contract_path[name] = oe.contract_path('BHia,Hij,BHja,BHjc->BHic',q, mask, k, v, optimize='random-greedy-128')[0]
+        output = contract('BHia,Hij,BHja,BHjc->BHic',q, mask, k, v,optimize=self.best_contract_path[name])
+        #output = output/np.sqrt(D1*S2)
+        output = rmsenorm(output)
+        return output
 
 def get_omask(slen, num_heads):
     decay = torch.log(1 - 2**(-5 - torch.arange(num_heads, dtype=torch.float)))
     index = torch.arange(slen).float()
-    mask = torch.tril(torch.ones(slen, slen))
-    mask = torch.masked_fill(
-        index[:, None] - index[None, :], ~mask.bool(), torch.inf)
-    mask = torch.exp(mask * decay[:, None, None])
-
-    mask = torch.nan_to_num(mask)
+    mask  = torch.tril(torch.ones(slen, slen))
+    mask  = torch.masked_fill(index[:, None] - index[None, :], ~mask.bool(), torch.inf)
+    mask  = torch.exp(mask * decay[:, None, None])
+    mask  = torch.nan_to_num(mask)
     omask = mask.unsqueeze(0)  # [1, h, t, t]
+    L     = mask.sum(dim=-1).sqrt()
     # mask = omask / omask.sum(dim=-1, keepdim=True).sqrt()
     # mask = torch.nan_to_num(mask, nan=0.0)
-    return omask
-
+    return omask,L
+def get_omask_reduce(slen, num_heads):
+    decay = torch.log(1 - 2**(-5 - torch.arange(num_heads, dtype=torch.float)))
+    index = torch.arange(slen).float()
+    mask  = torch.tril(torch.ones(slen, slen))
+    mask  = torch.masked_fill(index[:, None] - index[None, :], ~mask.bool(), torch.inf)
+    mask  = torch.exp(mask * decay[:, None, None])
+    mask  = torch.nan_to_num(mask)
+    omask = mask.unsqueeze(0)  # [1, h, t, t]
+    L     = mask.sum(dim=-1).sqrt()
+    # mask = omask / omask.sum(dim=-1, keepdim=True).sqrt()
+    # mask = torch.nan_to_num(mask, nan=0.0)
+    index = torch.arange(slen).float()
+    index = index - slen//2
+    Coef_Q= torch.exp( index[None,:] * decay[ :,None])
+    Coef_K= torch.exp(-index[None,:] * decay[ :,None])
+    scale = torch.exp(       slen//2 * decay[ :,None])
+    return (Coef_Q,Coef_K,scale),L
 if __name__ == "__main__":
     ## benchmark!!
     from tqdm.auto import tqdm
     import time
     import numpy as np
     import pandas as pd
-    layer1= ParallelRetention_fast()
-    layer2= ParallelRetention_fast2()
-    layer3= ParallelRetention_fast3()
-    layer4= ParallelRetention_reduce()
-    layer5= ParallelRetention_origin()
+    layers = [
+        #['layer_fast',  ParallelRetention_fast()],
+        # ['layer_fast2', ParallelRetention_fast2()],
+        # ['layer_fast3', ParallelRetention_fast3()],
+        ['layer_reduce', ParallelRetention_reduce()],
+        ['layer_origin', ParallelRetention_origin()],
+        #['layer_plain', ParallelRetention_plain()]
+    ]
+    
     records = []
     configs = []
     
     for B in [1]:
-        for S in [100, 500, 1000]:
+        for S in [1000]:
             for D1 in [8, 16, 32]:
-                for D2 in [64]:
+                for D2 in [8, 16, 32]:
                     for H in [16]:
                         configs.append([B,H,S,D1,D2])
     records = []
-    for B,H,S,D1,D2 in tqdm(configs, desc="Outer Loop", position=0):
+    dataframe = pd.DataFrame()
+    dtype = torch.bfloat16
+    #dtype = torch.float32
+    for i,(B,H,S,D1,D2) in tqdm(enumerate(configs), desc="Outer Loop", position=0):
+        omask_origin,mask_normer_origin =  get_omask(S,H)
+        omask_reduce,mask_normer_reduce =  get_omask_reduce(S,H)
+        q     =  (torch.randn(B,H,S,D1)/np.sqrt(S*D1)).cuda().to(dtype)#.bfloat16() #and bfloat16 may get wrong result if the q@k@v too large. Normlize it thus q@k@v be a normal distribution
+        k     =  (torch.randn(B,H,S,D1)/np.sqrt(S*D1)).cuda().to(dtype)#.bfloat16() #and bfloat16 may get wrong result if the q@k@v too large. Normlize it thus q@k@v be a normal distribution
+        v     =  (torch.randn(B,H,S,D2)/np.sqrt(S*D2)).cuda().to(dtype)#.bfloat16() #and bfloat16 may get wrong result if the q@k@v too large. Normlize it thus q@k@v be a normal distribution
+        omask_dict =      {'layer_origin':omask_origin.cuda().to(dtype), 
+                           'layer_reduce':tuple([t.cuda().to(dtype) for t in omask_reduce])
+                           }
+        mask_normer_dict={'layer_origin':mask_normer_origin.cuda().to(dtype), 
+                          'layer_reduce':mask_normer_reduce.cuda().to(dtype)}
+        gamma = None
+        O_results= {name:layer(q,k,v,omask_dict[name], 
+                                     mask_normer_dict[name], 
+                                     gamma, 
+                                     mask_normer_dict[name],
+                                     normlized=False) for name, layer in layers}
         
-        q     =  (torch.randn(B,H,S,D1)/np.sqrt(S*D1)).cuda()#  float16 and bfloat16 may get wrong result if the q@k@v too large. Normlize it thus q@k@v be a normal distribution
-        k     =  (torch.randn(B,H,S,D1)/np.sqrt(S*D1)).cuda()#  float16 and bfloat16 may get wrong result if the q@k@v too large. Normlize it thus q@k@v be a normal distribution
-        v     =  (torch.randn(B,H,S,D2)/np.sqrt(S*D2)).cuda()#  float16 and bfloat16 may get wrong result if the q@k@v too large. Normlize it thus q@k@v be a normal distribution
-        omask =                         get_omask(S,H).cuda()#  float16 and bfloat16 always get wrong result ###.half()
-        gamma = omask[0,:,1,0].float()
-        L     = omask.sum(dim=-1).sqrt()[...,None]
-        O1 = layer1(q,k,v,omask, gamma, L)
-        # O2 = layer2(q,k,v,omask, gamma, L)
-        # O3 = layer3(q,k,v,omask, gamma, L)
-        O4 = layer4(q,k,v,omask, gamma, L)
-        O5 = layer5(q,k,v,omask, gamma, L)
+        O_should = O_results['layer_origin']
+        error_record = {}
+        for name in O_results.keys():
+            if name in ['layer_origin']:continue
+            O = O_results[name]
+            e = torch.dist(O,O_should).item()
+            error_record[name] = e
         
-        e1 = torch.dist(O1,O5).item()
-        #e2 = torch.dist(O2,O5).item()
-        #e3 = torch.dist(O3,O5).item()
-        e4 = torch.dist(O4,O5).item()
-        
-        record = [B,H,S,D1,D2,e1,#e2,e3,
-                  e4
-                  ]
-        #print(record)
-        
-        for model in [layer1, 
-                    #   layer2, 
-                    #   layer3,
-                      layer4,
-                      layer5
-                      ]:
-            
+        time_cost_record = {}
+        for name, model in layers:
             costs = []
-            for _ in tqdm(range(100), desc="Inner Loop", position=1, leave=False):
+            for i in tqdm(range(100), desc="Inner Loop", position=1, leave=False):
                 now = time.time()
-                O = model(q,k,v,omask, gamma, L)
+                O = model(q,k,v,omask_dict[name], 
+                                     mask_normer_dict[name], 
+                                     gamma, 
+                                     mask_normer_dict[name])
                 #O.mean().backward()
                 cost = time.time()-now
-                costs.append(cost)
+                if i>1:costs.append(cost)
             cost = np.mean(cost)
             
-            record.append(cost)
-        records.append(record)
-    dataframe = pd.DataFrame(records, columns=['B','H','S','D1','D2','e1','e2',#'e3','e4',
-                                               'fast',#'fast2','fast3',
-                                               'reduce','origin'])
-    dataframe['speed_up_fast'] = np.round(dataframe['origin']/dataframe['fast'],3)
-    dataframe['speed_up_reduce'] = np.round(dataframe['origin']/dataframe['reduce'],3)
+            time_cost_record[name] = cost
+        line_record = {}
+        for name in time_cost_record.keys():
+            line_record[name+'_time'] = time_cost_record[name]
+        for name in error_record.keys():
+            line_record[name+'_error'] = error_record[name]
+        now_line  = pd.DataFrame([[B,H,S,D1,D2]],columns=['B','H','S','D1','D2'],index=[i])
+        info_line = pd.DataFrame(line_record,index=[i])
+        now_line = pd.concat([now_line,info_line],axis=1)
+        dataframe= pd.concat([dataframe,now_line])
     print(dataframe)
-    dataframe.to_csv('benchmark_more.csv',index=False)
+    # dataframe = pd.DataFrame(records, columns=['B','H','S','D1','D2','e1','e2',#'e3','e4',
+    #                                            'fast',#'fast2','fast3',
+    #                                            'reduce','origin'])
+    # dataframe['speed_up_fast'] = np.round(dataframe['origin']/dataframe['fast'],3)
+    # dataframe['speed_up_reduce'] = np.round(dataframe['origin']/dataframe['reduce'],3)
+    # print(dataframe)
+    # dataframe.to_csv('benchmark_more.csv',index=False)
 
     ####### percision case
     # for B in [1]:
