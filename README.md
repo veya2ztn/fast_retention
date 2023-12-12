@@ -284,3 +284,22 @@ current_kv = torch.einsum('Hi,BHiac->BHiac', gamma, past_kv) +
 current_gk = torch.einsum('Hi,BHia->BHia', gamma, past_gk) + 
 			 torch.einsum('Hij,BHja-> BHia', mask, k_more)
 ```
+Notice, at current (2023.10.24), the `group_norm` is use `RMSNorm` which normalize the $D2$ dimension and ensure each vector $|x \rangle$ (D2,) in (B, H, S) satisfy:
+```math
+\langle x|x \rangle=D2
+```
+That is 
+```math
+X_i^{c}\rightarrow \frac{X_i^{c}}{\sqrt{X_i^\alpha X_i^\alpha}}
+```
+Given any **gauge** only effect on the $i$ dimension $Y_i^c =  T_iX_i^c$.
+
+The result will hold invariant.
+```math
+\frac{Y_i^{c}}{\sqrt{Y_i^\alpha Y_i^\alpha}}=\frac{T_iX_i^c}{\sqrt{T_iX_i^\alpha T_iX_i^\alpha}}=\frac{X_i^{c}}{\sqrt{X_i^\alpha X_i^\alpha}}
+```
+This mean we can totally remove the $P_i$ or `current_gk` if we finally apply the group_norm normalization. 
+
+For numerical reason, we can rescale the `retention` use $P_i$ to avoid `Nan` or `Inf`. 
+
+The cost to obtain  `current_gk`  and `current_kv` almost same, thus, disable computing the `retention` vis set `normlize_for_stable=False` can indeed accelerate the inference 2 times fast.
